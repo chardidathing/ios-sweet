@@ -107,6 +107,9 @@ USB = dict(
     # resets are GCC_USB3_DP_PHY_PRIM_BCR (global) and GCC_USB3_PHY_PRIM_BCR,
     # ssphy_reg is the DT qcom,qmp-phy-reg-offset list (phy-msm-ssusb-qmp.c
     # enum order) and ssphy_seq the qcom,qmp-phy-init-seq (offset, value, delay us)
+    # the apps SMMU (qsmmu-v500) that usb0 (stream id 0, anoc_1_tbu) sits
+    # behind: the driver switches that stream to bypass before its first dma
+    smmu=0x15000000, smmu_sid=0,
     ssphy=0x088e8000, ssphy_reset=[0x50008, 0x50000],
     ssphy_reg=[0x1c14, 0x1f08, 0x1f14, 0x1c40, 0x1c00, 0x1c44, 0xffff, 0x2a18,
                0x08, 0x04, 0x1c, 0x00, 0x10, 0x0c, 0x1c8c],

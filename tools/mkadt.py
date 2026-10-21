@@ -210,7 +210,7 @@ def build(board, seed=None, qemu=False, highmem=False):
     if b.TOUCH:
         board_nodes.append(board_node('sweet-touch', b.TOUCH, wide=('se', 'tlmm')))
     if b.USB:
-        board_nodes.append(board_node('sweet-usb', b.USB, wide=('dwc3', 'qscratch', 'qusb2', 'hsphy', 'eud', 'ssphy')))
+        board_nodes.append(board_node('sweet-usb', b.USB, wide=('dwc3', 'qscratch', 'qusb2', 'hsphy', 'eud', 'ssphy', 'smmu')))
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.

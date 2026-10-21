@@ -1,0 +1,132 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 830bc7d..4ed66e0 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -72,7 +72,12 @@ static uint32_t usb_cbcr_off[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ static uint32_t usb_rd(vm_offset_t base, uint32_t off);
+ static uint32_t usb_gdscr;
+ static bool usb_hs_only;   /* no SuperSpeed PHY: pipe domain from the UTMI clock */
++/* SMMU in front of the controller (kona apps_smmu) and USB's stream ID: the
++ * stream is switched to bypass before the first DMA, see usb_smmu_bypass */
++static uint64_t usb_smmu_pa;
++static uint32_t usb_smmu_sid;
+ static unsigned usb_pace_ms = 2000; /* bring-up step pacing, see usb_pace */
++static void usb_pace(void);
+ static uint64_t usb_dwc3_pa, usb_qscratch_pa, usb_qusb2_pa;
+ /* SNPS femto HS PHY (kona): hsphy register base, its GCC BCR, the EUD enable
+  * register that means the debugger owns the PHY, and the DT parameter
+@@ -118,6 +123,14 @@ usb_config(DTEntry node)
+ 	if (SecureDTGetProperty(node, "qusb2", &prop, &size) == kSuccess && size == 8) {
+ 		memcpy(&usb_qusb2_pa, prop, 8);
+ 	}
++	usb_smmu_pa = 0;
++	if (SecureDTGetProperty(node, "smmu", &prop, &size) == kSuccess && size == 8) {
++		memcpy(&usb_smmu_pa, prop, 8);
++		if (SecureDTGetProperty(node, "smmu-sid", (void const **)&val, &size) != kSuccess || size != 4) {
++			return false;
++		}
++		usb_smmu_sid = *val;
++	}
+ 	usb_ssphy_pa = 0;
+ 	if (SecureDTGetProperty(node, "ssphy", &prop, &size) == kSuccess && size == 8) {
+ 		memcpy(&usb_ssphy_pa, prop, 8);
+@@ -184,6 +197,90 @@ hsphy_rmw(vm_offset_t phy, uint32_t off, uint32_t mask, uint32_t val)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++/*
++ * SMMUv2 global register space 0 (Linux arm-smmu.c). ABL leaves USB's stream
++ * matched to its own translation context; a DMA to our memory through those
++ * stale tables stalls the bus and resets the SoC. Linux installs its own
++ * context, here the stream simply bypasses translation.
++ */
++#define SMMU_SCR0           0x000
++#define   SCR0_CLIENTPD     (1u << 0)
++#define   SCR0_USFCFG       (1u << 10)
++#define SMMU_IDR0           0x020
++#define   IDR0_NUMSMRG(v)   ((v) & 0xffu)
++#define   IDR0_EXIDS        (1u << 8)
++#define   IDR0_SMS          (1u << 31)
++#define SMMU_SMR(n)         (0x800u + 4u * (n))
++#define   SMR_VALID         (1u << 31)
++#define SMMU_S2CR(n)        (0xc00u + 4u * (n))
++#define   S2CR_TYPE_MASK    (3u << 16)
++#define   S2CR_TYPE_BYPASS  (1u << 16)
++#define   S2CR_EXIDVALID    (1u << 10)
++
++static void
++usb_smmu_bypass(void)
++{
++	if (usb_smmu_pa == 0) {
++		return;
++	}
++	vm_offset_t smmu = ml_io_map((vm_offset_t)usb_smmu_pa, 0x1000);
++	if (smmu == 0) {
++		return;
++	}
++	uint32_t scr0 = usb_rd(smmu, SMMU_SCR0), idr0 = usb_rd(smmu, SMMU_IDR0);
++	unsigned nsmr = IDR0_NUMSMRG(idr0);
++	bool exids = (idr0 & IDR0_EXIDS) != 0;
++	printf("SWEET USB: SMMU sCR0 0x%08x IDR0 0x%08x: %u stream match groups%s%s\n", scr0, idr0, nsmr,
++	    (scr0 & SCR0_CLIENTPD) ? ", client port disabled (global bypass)" : "",
++	    (scr0 & SCR0_USFCFG) ? ", unmatched streams fault" : ", unmatched streams bypass");
++	if ((scr0 & SCR0_CLIENTPD) || !(idr0 & IDR0_SMS) || nsmr == 0) {
++		return;
++	}
++	int found = -1, spare = -1;
++	for (unsigned i = 0; i < nsmr; i++) {
++		uint32_t smr = usb_rd(smmu, SMMU_SMR(i)), s2cr = usb_rd(smmu, SMMU_S2CR(i));
++		bool valid = exids ? (s2cr & S2CR_EXIDVALID) != 0 : (smr & SMR_VALID) != 0;
++		uint32_t id = exids ? (smr & 0xffffu) : (smr & 0x7fffu);
++		uint32_t mask = exids ? (smr >> 16) : ((smr >> 16) & 0x7fffu);
++		if (!valid) {
++			if (spare < 0) {
++				spare = (int)i;
++			}
++			continue;
++		}
++		if ((id & ~mask) == (usb_smmu_sid & ~mask)) {
++			printf("SWEET USB: SMMU stream 0x%x matched by group %u: SMR 0x%08x S2CR 0x%08x\n",
++			    usb_smmu_sid, i, smr, s2cr);
++			found = (int)i;
++			break;
++		}
++	}
++	if (found >= 0) {
++		uint32_t s2cr = usb_rd(smmu, SMMU_S2CR(found));
++		*(volatile uint32_t *)(smmu + SMMU_S2CR(found)) = (s2cr & ~S2CR_TYPE_MASK) | S2CR_TYPE_BYPASS;
++	} else if (!(scr0 & SCR0_USFCFG)) {
++		printf("SWEET USB: SMMU stream 0x%x unmatched, already bypasses\n", usb_smmu_sid);
++		return;
++	} else if (spare >= 0) {
++		found = spare;
++		if (exids) {
++			*(volatile uint32_t *)(smmu + SMMU_SMR(found)) = usb_smmu_sid;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			*(volatile uint32_t *)(smmu + SMMU_S2CR(found)) = S2CR_TYPE_BYPASS | S2CR_EXIDVALID;
++		} else {
++			*(volatile uint32_t *)(smmu + SMMU_S2CR(found)) = S2CR_TYPE_BYPASS;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			*(volatile uint32_t *)(smmu + SMMU_SMR(found)) = SMR_VALID | usb_smmu_sid;
++		}
++	} else {
++		printf("SWEET USB: SMMU has no spare stream match group for stream 0x%x\n", usb_smmu_sid);
++		return;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("SWEET USB: SMMU group %d now SMR 0x%08x S2CR 0x%08x (bypass)\n", found,
++	    usb_rd(smmu, SMMU_SMR(found)), usb_rd(smmu, SMMU_S2CR(found)));
++}
++
+ /* phy-msm-ssusb-qmp.c: indexes into ssphy-reg, and the bits it writes */
+ enum {
+ 	QMP_PCS_STATUS, QMP_AUTONOMOUS_MODE_CTRL, QMP_LFPS_RXTERM_IRQ_CLEAR, QMP_POWER_DOWN_CONTROL,
+@@ -424,6 +521,8 @@ sweet_usb_probe(void)
+ 			usb_ssphy_init(gcc);
+ 		}
+ 		usb_hs_only = !ss;
++		usb_smmu_bypass();
++		usb_pace();
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+ 	if (usb_qusb2_pa == 0) {
