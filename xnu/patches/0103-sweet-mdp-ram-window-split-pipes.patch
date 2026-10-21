@@ -1,0 +1,714 @@
+diff --git a/bsd/dev/sweet_mdp.c b/bsd/dev/sweet_mdp.c
+index 1263356..e90c392 100644
+--- a/bsd/dev/sweet_mdp.c
++++ b/bsd/dev/sweet_mdp.c
+@@ -1,19 +1,22 @@
+ /*
+  * Present through the display processor (Qualcomm MDP, "sde" in the vendor
+- * tree). The pipe that ABL set up for the splash keeps fetching the panel
+- * buffer; here a VIG pipe (one with a QSEED3 scaler) fetches the client's
+- * logical-size surface straight from its memory and scales it to the panel,
+- * so a swap is an address write instead of a 10 MB copy. Wiring comes from
+- * the ADT node /sweet-mdp (tools/mkadt.py):
++ * tree). ABL leaves one or two VIG pipes fetching the splash buffer (pdx203:
++ * two, one per 548-pixel half of the panel, each into its own layer mixer).
++ * Those pipes keep their stage and format, and from the first swap on they
++ * fetch the client's logical-size surface instead, each the slice of it
++ * that belongs to its half, with their QSEED3 scalers fitting it to the
++ * panel. A swap is then an address write instead of a 10 MB copy.
++ *
++ * The pipes' address registers are 32 bits wide and the kernel's RAM sits
++ * above 4 GB, so the mdp's SMMU stream gets a context bank with a linear
++ * window over the RAM (sweet_smmu.c) and the pipes are given iovas.
++ *
++ * Wiring comes from the ADT node /sweet-mdp (tools/mkadt.py):
+  *   base      mdp_phys, the MDSS register block
+- *   top       MDP top block (clock controls)         sde-off
+- *   ctl, lm   ctl_0 and lm_0                         sde-ctl-off, sde-mixer-off
+- *   qseed     the scaler block inside a vig pipe       sde-vig-qseed-off
+- *   clk-ctrl, clk-bit  vig_0's clock enable in top   sde-sspp-clk-ctrl
+- *   sspp      the eight source pipes, four vig then four dma, to find
+- *             the splash pipe (its SRC0_ADDR is the panel buffer)
+- *   smmu, smmu-sid  the apps SMMU and the mdp's unsecure stream (optional,
+- *             boot-arg sweetmdp_smmu=0 leaves it alone)
++ *   ctl, lm   ctl_0 and lm_0 (lm_1 is 0x1000 on)   sde-ctl-off, sde-mixer-off
++ *   qseed     the scaler block inside a vig pipe   sde-vig-qseed-off
++ *   sspp      the eight source pipes, four vig then four dma
++ *   smmu, smmu-sid  the apps SMMU and the mdp's unsecure stream
+  * Register offsets from techpack/display/msm/sde/sde_hw_{sspp,ctl,util,lm}.c.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -22,9 +25,10 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
++#include "sweet_smmu.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-extern int sweet_smmu_identity(const char *tag, uint64_t pa, uint32_t sid);
++extern unsigned long gPhysBase, gPhysSize;      /* the ram the kernel manages, osfmk/arm64/arm_vm_init.c */
+ bool sweet_mdp_init(uint64_t fb_phys, uint32_t fb_w, uint32_t fb_h, uint32_t src_w, uint32_t src_h, int fit);
+ void sweet_mdp_show(uint64_t phys, uint32_t stride);
+ void sweet_mdp_clean(const void *va, size_t len);
+@@ -39,21 +43,11 @@ void sweet_mdp_clean(const void *va, size_t len);
+ #define SSPP_SRC_UNPACK_PATTERN 0x34
+ #define SSPP_SRC_OP_MODE        0x38
+ #define   OP_PE_OVERRIDE        (1u << 31)      /* use the SW pixel extension registers */
+-#define SSPP_SRC_CONSTANT_COLOR 0x3c
+-#define SSPP_EXCL_REC_CTL       0x40
+-#define SSPP_UBWC_STATIC_CTRL   0x44
+-#define SSPP_FETCH_CONFIG       0x48
+-#define SSPP_DANGER_LUT         0x60
+-#define SSPP_SAFE_LUT           0x64
+-#define SSPP_CREQ_LUT           0x68
+ #define SSPP_QOS_CTRL           0x6c
+-#define SSPP_CREQ_LUT_0         0x74
+-#define SSPP_CREQ_LUT_1         0x78
+ #define SSPP_DECIMATION_CONFIG  0xb4
+ #define SSPP_SW_PIX_EXT_C0_LR   0x100   /* C0, then C1C2 at +0x10 and C3 at +0x20 */
+ #define SSPP_SW_PIX_EXT_C0_TB   0x104
+ #define SSPP_SW_PIX_EXT_C0_REQ  0x108
+-#define SSPP_MULTIRECT_OPMODE   0x170
+ #define QSEED3_HW_VERSION       0x00
+ #define QSEED3_OP_MODE          0x04
+ #define QSEED3_PHASE_STEP_Y_H   0x10
+@@ -69,41 +63,35 @@ void sweet_mdp_clean(const void *va, size_t len);
+ /* scaler on, bilinear rgb (3) and alpha (1), alpha blending, not a DX format */
+ #define QSEED3_OP_MODE_RGB_BIL  ((1u << 0) | (3u << 16) | (1u << 31) | (1u << 14) | (1u << 10) | (1u << 29))
+ #define QSEED3_PRELOAD_DEFAULT  0x03040304      /* h 4, v 3, both planes */
+-#define CTL_LAYER0              0x00    /* lm_0's stage config and its ext registers */
+-#define CTL_LAYER0_EXT          0x40
+-#define CTL_LAYER0_EXT2         0x70
+-#define CTL_LAYER0_EXT3         0xa0
+-#define   CTL_MIXER_BORDER_OUT  (1u << 24)
++#define CTL_LAYER(lm)           (4u * (lm))     /* stage config of lm_0 and lm_1 */
++#define CTL_LAYER_EXT(lm)       (0x40u + 4u * (lm))
+ #define CTL_TOP                 0x14
+ #define CTL_FLUSH               0x18
+-#define   FLUSH_LM0             (1u << 6)
+-#define   FLUSH_CTL             (1u << 17)
+ #define LM_OP_MODE              0x00
+ #define LM_OUT_SIZE             0x04
+-#define LM_BORDER_COLOR_0       0x08
+-#define LM_BORDER_COLOR_1       0x10
++#define LM_STRIDE               0x1000
+ #define MDP_PIPES               8
+ #define MDP_VIG_PIPES           4
++#define MDP_LMS                 2
++/* CTL_FLUSH bit of each pipe (sde_hw_ctl.c sspp_tbl) */
++static const uint8_t mdp_flush_tbl[MDP_PIPES] = {0, 1, 2, 18, 11, 12, 24, 25};
+ 
+-/* CTL_FLUSH bit of each pipe and where its stage lives in the lm_0 layer
+- * registers (sde_hw_ctl.c sspp_tbl and sspp_reg_cfg_tbl): the 3-bit stage
+- * field in CTL_LAYER plus its fourth bit in LAYER_EXT, or a 4-bit field in
+- * LAYER_EXT2 for dma_2/3 */
+-static const struct {
+-	uint8_t flush, reg, shift, extbit;
+-} mdp_pipe_tbl[MDP_PIPES] = {
+-	{0, 0, 0, 0}, {1, 0, 3, 2}, {2, 0, 6, 4}, {18, 0, 26, 6},
+-	{11, 0, 18, 16}, {12, 0, 21, 18}, {24, 2, 0, 0xff}, {25, 2, 4, 0xff},
++struct mdp_pipe {
++	int idx;                        /* into mdp_sspp */
++	uint32_t out_x, out_w;          /* its part of the panel, as ABL staged it */
++	uint32_t src_x, src_w;          /* the slice of the logical surface it shows */
+ };
+ 
+ static vm_offset_t mdp_base;
+-static uint32_t mdp_top, mdp_ctl, mdp_lm, mdp_qseed, mdp_clk_ctrl, mdp_clk_bit;
++static uint32_t mdp_ctl, mdp_lm, mdp_qseed;
+ static uint32_t mdp_sspp[MDP_PIPES];
+-static int mdp_splash_pipe = -1;        /* index into mdp_sspp, the pipe ABL staged */
+-static int mdp_pipe = -1;               /* the pipe that fetches the client surface */
+-static uint32_t mdp_src_w, mdp_src_h, mdp_dst_x, mdp_dst_y, mdp_dst_w, mdp_dst_h, mdp_fb_w, mdp_fb_h;
+-static uint64_t mdp_shown;              /* SRC0_ADDR now in the pipe, 0 = still the splash */
++static struct mdp_pipe mdp_pipes[MDP_LMS];
++static int mdp_npipes;
++static uint32_t mdp_src_w, mdp_src_h, mdp_dst_y, mdp_dst_h;
++static struct sweet_smmu_ctx mdp_smmu;
++static uint64_t mdp_shown;              /* physical address the pipes fetch, 0 = still the splash */
+ static uint32_t mdp_shown_stride;
++static unsigned mdp_show_logged;
+ 
+ static uint32_t
+ mdp_rd(uint32_t off)
+@@ -147,30 +135,31 @@ sweet_mdp_clean(const void *va, size_t len)
+ }
+ 
+ static void
+-mdp_dump(void)
++mdp_dump(uint64_t fb_phys)
+ {
+-	printf("SWEET MDP: hw 0x%08x ctl top 0x%08x flush 0x%08x layer0 0x%08x ext 0x%08x ext2 0x%08x ext3 0x%08x lm0 op 0x%08x out 0x%08x clk 0x%08x\n",
+-	    mdp_rd(0), mdp_rd(mdp_ctl + CTL_TOP), mdp_rd(mdp_ctl + CTL_FLUSH),
+-	    mdp_rd(mdp_ctl + CTL_LAYER0), mdp_rd(mdp_ctl + CTL_LAYER0_EXT), mdp_rd(mdp_ctl + CTL_LAYER0_EXT2),
+-	    mdp_rd(mdp_ctl + CTL_LAYER0_EXT3), mdp_rd(mdp_lm + LM_OP_MODE), mdp_rd(mdp_lm + LM_OUT_SIZE),
+-	    mdp_rd(mdp_top + mdp_clk_ctrl));
++	printf("SWEET MDP: hw 0x%08x ctl top 0x%08x flush 0x%08x\n", mdp_rd(0), mdp_rd(mdp_ctl + CTL_TOP), mdp_rd(mdp_ctl + CTL_FLUSH));
++	for (uint32_t lm = 0; lm < MDP_LMS; lm++) {
++		printf("SWEET MDP: lm%u layer 0x%08x ext 0x%08x op 0x%08x out 0x%08x\n", lm,
++		    mdp_rd(mdp_ctl + CTL_LAYER(lm)), mdp_rd(mdp_ctl + CTL_LAYER_EXT(lm)),
++		    mdp_rd(mdp_lm + lm * LM_STRIDE + LM_OP_MODE), mdp_rd(mdp_lm + lm * LM_STRIDE + LM_OUT_SIZE));
++	}
+ 	for (int i = 0; i < MDP_PIPES; i++) {
+-		uint32_t p = mdp_sspp[i];
++		uint32_t p = mdp_sspp[i], addr = mdp_rd(p + SSPP_SRC0_ADDR);
+ 		printf("SWEET MDP: %s%d addr 0x%08x src 0x%08x at 0x%08x out 0x%08x at 0x%08x stride 0x%08x fmt 0x%08x unpack 0x%08x op 0x%08x qos 0x%08x%s\n",
+ 		    i < MDP_VIG_PIPES ? "vig" : "dma", i < MDP_VIG_PIPES ? i : i - MDP_VIG_PIPES,
+-		    mdp_rd(p + SSPP_SRC0_ADDR), mdp_rd(p + SSPP_SRC_SIZE), mdp_rd(p + SSPP_SRC_XY),
++		    addr, mdp_rd(p + SSPP_SRC_SIZE), mdp_rd(p + SSPP_SRC_XY),
+ 		    mdp_rd(p + SSPP_OUT_SIZE), mdp_rd(p + SSPP_OUT_XY), mdp_rd(p + SSPP_SRC_YSTRIDE0),
+ 		    mdp_rd(p + SSPP_SRC_FORMAT), mdp_rd(p + SSPP_SRC_UNPACK_PATTERN), mdp_rd(p + SSPP_SRC_OP_MODE),
+-		    mdp_rd(p + SSPP_QOS_CTRL), i == mdp_splash_pipe ? " (splash)" : "");
++		    mdp_rd(p + SSPP_QOS_CTRL), addr == (uint32_t)fb_phys ? " (splash)" : "");
+ 	}
+ }
+ 
+ /*
+- * Reads the wiring and the splash setup, picks the pipe and the output
+- * rectangle. fit 0 scales the logical size to the panel width (same scale
+- * both ways, black rows above and below), fit 1 stretches it to the panel.
+- * Returns false when the node is absent or the splash pipe is not found,
+- * the caller then keeps the cpu present.
++ * Reads the wiring and the splash setup and works out each pipe's slice.
++ * fit 0 scales the logical size to the panel width (same scale both ways,
++ * black rows above and below), fit 1 stretches it to the panel. Returns
++ * false when the node is absent, the splash pipes are not VIG ones or the
++ * RAM window could not be set up, the caller then keeps the cpu present.
+  */
+ bool
+ sweet_mdp_init(uint64_t fb_phys, uint32_t fb_w, uint32_t fb_h, uint32_t src_w, uint32_t src_h, int fit)
+@@ -179,7 +168,7 @@ sweet_mdp_init(uint64_t fb_phys, uint32_t fb_w, uint32_t fb_h, uint32_t src_w, u
+ 	void const *prop;
+ 	unsigned int size;
+ 	uint64_t base = 0, smmu = 0;
+-	uint32_t sid = 0;
++	uint32_t sid = 0, dst_w;
+ 
+ 	if (SecureDTLookupEntry(NULL, "/sweet-mdp", &node) != kSuccess) {
+ 		return false;
+@@ -188,9 +177,7 @@ sweet_mdp_init(uint64_t fb_phys, uint32_t fb_w, uint32_t fb_h, uint32_t src_w, u
+ 		return false;
+ 	}
+ 	memcpy(&base, prop, 8);
+-	if (!mdp_prop(node, "top", &mdp_top) || !mdp_prop(node, "ctl", &mdp_ctl) || !mdp_prop(node, "lm", &mdp_lm) ||
+-	    !mdp_prop(node, "qseed", &mdp_qseed) ||
+-	    !mdp_prop(node, "clk-ctrl", &mdp_clk_ctrl) || !mdp_prop(node, "clk-bit", &mdp_clk_bit)) {
++	if (!mdp_prop(node, "ctl", &mdp_ctl) || !mdp_prop(node, "lm", &mdp_lm) || !mdp_prop(node, "qseed", &mdp_qseed)) {
+ 		printf("SWEET MDP: /sweet-mdp is incomplete\n");
+ 		return false;
+ 	}
+@@ -209,153 +196,150 @@ sweet_mdp_init(uint64_t fb_phys, uint32_t fb_w, uint32_t fb_h, uint32_t src_w, u
+ 	if (mdp_base == 0) {
+ 		return false;
+ 	}
+-	for (int i = 0; i < MDP_PIPES; i++) {
+-		if (mdp_rd(mdp_sspp[i] + SSPP_SRC0_ADDR) == (uint32_t)fb_phys) {
+-			mdp_splash_pipe = i;
+-			break;
++	mdp_dump(fb_phys);
++	mdp_npipes = 0;
++	for (int i = 0; i < MDP_PIPES && mdp_npipes < MDP_LMS; i++) {
++		if (mdp_rd(mdp_sspp[i] + SSPP_SRC0_ADDR) != (uint32_t)fb_phys) {
++			continue;
+ 		}
++		if (i >= MDP_VIG_PIPES) {
++			printf("SWEET MDP: the splash is on a dma pipe (no scaler), cpu present\n");
++			return false;
++		}
++		struct mdp_pipe *pp = &mdp_pipes[mdp_npipes++];
++		pp->idx = i;
++		pp->out_x = mdp_rd(mdp_sspp[i] + SSPP_OUT_XY) & 0xffffu;
++		pp->out_w = mdp_rd(mdp_sspp[i] + SSPP_OUT_SIZE) & 0xffffu;
+ 	}
+-	mdp_dump();
+-	if (mdp_splash_pipe < 0) {
++	if (mdp_npipes == 0) {
+ 		printf("SWEET MDP: no pipe fetches the splash at 0x%llx, cpu present\n", fb_phys);
+ 		return false;
+ 	}
+-	/* a vig pipe has the scaler, the splash's own if it is one, else vig_0 */
+-	mdp_pipe = mdp_splash_pipe < MDP_VIG_PIPES ? mdp_splash_pipe : 0;
+-	mdp_fb_w = fb_w;
+-	mdp_fb_h = fb_h;
++	/* the pipes take 32-bit addresses: the RAM is reached through a window */
++	if (smmu == 0) {
++		printf("SWEET MDP: no smmu in /sweet-mdp, cpu present\n");
++		return false;
++	}
++	if (sweet_smmu_attach(&mdp_smmu, "SWEET MDP", smmu, sid, gPhysBase, gPhysSize) != 0) {
++		return false;
++	}
+ 	mdp_src_w = src_w;
+ 	mdp_src_h = src_h;
+ 	if (fit == 1) {
+-		mdp_dst_w = fb_w;
++		dst_w = fb_w;
+ 		mdp_dst_h = fb_h;
+ 	} else {
+-		mdp_dst_w = fb_w;
++		dst_w = fb_w;
+ 		mdp_dst_h = (uint32_t)(((uint64_t)src_h * fb_w) / src_w);
+ 		if (mdp_dst_h > fb_h) {
+ 			mdp_dst_h = fb_h;
+-			mdp_dst_w = (uint32_t)(((uint64_t)src_w * fb_h) / src_h);
++			dst_w = (uint32_t)(((uint64_t)src_w * fb_h) / src_h);
+ 		}
+ 	}
+-	mdp_dst_x = (fb_w - mdp_dst_w) / 2;
+ 	mdp_dst_y = (fb_h - mdp_dst_h) / 2;
+-	int use_smmu = 1;
+-	PE_parse_boot_argn("sweetmdp_smmu", &use_smmu, sizeof(use_smmu));
+-	if (smmu != 0 && use_smmu) {
+-		sweet_smmu_identity("SWEET MDP", smmu, sid);
++	/* each pipe keeps its part of the panel and gets the matching slice of
++	 * the source (dst_w < fb_w only when fit 0 has to fit the height) */
++	for (int i = 0; i < mdp_npipes; i++) {
++		struct mdp_pipe *pp = &mdp_pipes[i];
++		if (dst_w < fb_w) {
++			uint32_t bar = (fb_w - dst_w) / 2;
++			uint32_t x0 = pp->out_x > bar ? pp->out_x - bar : 0;
++			uint32_t x1 = pp->out_x + pp->out_w > bar + dst_w ? dst_w : pp->out_x + pp->out_w - bar;
++			pp->out_x = bar + x0;
++			pp->out_w = x1 > x0 ? x1 - x0 : 0;
++			pp->src_x = (uint32_t)(((uint64_t)x0 * src_w) / dst_w);
++			pp->src_w = (uint32_t)(((uint64_t)pp->out_w * src_w) / dst_w);
++		} else {
++			pp->src_x = (uint32_t)(((uint64_t)pp->out_x * src_w) / fb_w);
++			pp->src_w = (uint32_t)(((uint64_t)pp->out_w * src_w) / fb_w);
++		}
++		if (pp->src_x + pp->src_w > src_w) {
++			pp->src_w = src_w - pp->src_x;
++		}
++		printf("SWEET MDP: vig%d (scaler v0x%x) will show %u..%u of %ux%u as %ux%u at %u,%u\n",
++		    pp->idx, mdp_rd(mdp_sspp[pp->idx] + mdp_qseed + QSEED3_HW_VERSION),
++		    pp->src_x, pp->src_x + pp->src_w, src_w, src_h, pp->out_w, mdp_dst_h, pp->out_x, mdp_dst_y);
+ 	}
+-	printf("SWEET MDP: %s%d (scaler v0x%x) will show %ux%u as %ux%u at %u,%u on the %ux%u panel\n",
+-	    mdp_pipe < MDP_VIG_PIPES ? "vig" : "dma", mdp_pipe, mdp_rd(mdp_sspp[mdp_pipe] + mdp_qseed + QSEED3_HW_VERSION),
+-	    src_w, src_h, mdp_dst_w, mdp_dst_h, mdp_dst_x, mdp_dst_y, fb_w, fb_h);
+ 	return true;
+ }
+ 
+-/* first show: the pipe takes over the splash pipe's format, qos and stage */
++/* program one pipe for its slice, with the scaler */
+ static void
+-mdp_program(uint64_t phys, uint32_t stride)
++mdp_program(const struct mdp_pipe *pp, uint32_t iova, uint32_t stride)
+ {
+-	uint32_t p = mdp_sspp[mdp_pipe], old = mdp_sspp[mdp_splash_pipe], q = p + mdp_qseed;
+-	uint32_t flush = (1u << mdp_pipe_tbl[mdp_pipe].flush) | FLUSH_LM0 | FLUSH_CTL;
++	uint32_t p = mdp_sspp[pp->idx], q = p + mdp_qseed;
++	uint32_t step_x = (uint32_t)(((uint64_t)pp->src_w << PHASE_STEP_SHIFT) / pp->out_w);
++	uint32_t step_y = (uint32_t)(((uint64_t)mdp_src_h << PHASE_STEP_SHIFT) / mdp_dst_h);
+ 
+-	if (mdp_pipe != mdp_splash_pipe) {
+-		mdp_wr(mdp_top + mdp_clk_ctrl, mdp_rd(mdp_top + mdp_clk_ctrl) | (1u << mdp_clk_bit));
+-		mdp_wr(p + SSPP_DANGER_LUT, mdp_rd(old + SSPP_DANGER_LUT));
+-		mdp_wr(p + SSPP_SAFE_LUT, mdp_rd(old + SSPP_SAFE_LUT));
+-		mdp_wr(p + SSPP_CREQ_LUT, mdp_rd(old + SSPP_CREQ_LUT));
+-		mdp_wr(p + SSPP_CREQ_LUT_0, mdp_rd(old + SSPP_CREQ_LUT_0));
+-		mdp_wr(p + SSPP_CREQ_LUT_1, mdp_rd(old + SSPP_CREQ_LUT_1));
+-		mdp_wr(p + SSPP_QOS_CTRL, mdp_rd(old + SSPP_QOS_CTRL));
+-		mdp_wr(p + SSPP_SRC_FORMAT, mdp_rd(old + SSPP_SRC_FORMAT));
+-		mdp_wr(p + SSPP_SRC_UNPACK_PATTERN, mdp_rd(old + SSPP_SRC_UNPACK_PATTERN));
+-		mdp_wr(p + SSPP_SRC_CONSTANT_COLOR, mdp_rd(old + SSPP_SRC_CONSTANT_COLOR));
+-		mdp_wr(p + SSPP_EXCL_REC_CTL, mdp_rd(old + SSPP_EXCL_REC_CTL));
+-		mdp_wr(p + SSPP_UBWC_STATIC_CTRL, mdp_rd(old + SSPP_UBWC_STATIC_CTRL));
+-		mdp_wr(p + SSPP_FETCH_CONFIG, mdp_rd(old + SSPP_FETCH_CONFIG));
+-		mdp_wr(p + SSPP_MULTIRECT_OPMODE, mdp_rd(old + SSPP_MULTIRECT_OPMODE));
+-	}
+-	mdp_wr(p + SSPP_SRC_OP_MODE, mdp_rd(old + SSPP_SRC_OP_MODE) | OP_PE_OVERRIDE);
+-	mdp_wr(p + SSPP_SRC_SIZE, (mdp_src_h << 16) | mdp_src_w);
+-	mdp_wr(p + SSPP_SRC_XY, 0);
+-	mdp_wr(p + SSPP_OUT_SIZE, (mdp_dst_h << 16) | mdp_dst_w);
+-	mdp_wr(p + SSPP_OUT_XY, (mdp_dst_y << 16) | mdp_dst_x);
++	mdp_wr(p + SSPP_SRC_OP_MODE, mdp_rd(p + SSPP_SRC_OP_MODE) | OP_PE_OVERRIDE);
++	mdp_wr(p + SSPP_SRC_SIZE, (mdp_src_h << 16) | pp->src_w);
++	mdp_wr(p + SSPP_SRC_XY, pp->src_x);
++	mdp_wr(p + SSPP_OUT_SIZE, (mdp_dst_h << 16) | pp->out_w);
++	mdp_wr(p + SSPP_OUT_XY, (mdp_dst_y << 16) | pp->out_x);
+ 	mdp_wr(p + SSPP_SRC_YSTRIDE0, stride);
+-	mdp_wr(p + SSPP_SRC0_ADDR, (uint32_t)phys);
++	mdp_wr(p + SSPP_SRC0_ADDR, iova);
+ 	mdp_wr(p + SSPP_DECIMATION_CONFIG, 0);
+-	/* no edge extension, the scaler is told the whole source */
++	/* no edge extension, the scaler is told the whole slice */
+ 	for (uint32_t c = 0; c < 3; c++) {
+ 		mdp_wr(p + SSPP_SW_PIX_EXT_C0_LR + 0x10 * c, 0);
+ 		mdp_wr(p + SSPP_SW_PIX_EXT_C0_TB + 0x10 * c, 0);
+-		mdp_wr(p + SSPP_SW_PIX_EXT_C0_REQ + 0x10 * c, (mdp_src_h << 16) | mdp_src_w);
++		mdp_wr(p + SSPP_SW_PIX_EXT_C0_REQ + 0x10 * c, (mdp_src_h << 16) | pp->src_w);
+ 	}
+ 	for (uint32_t c = 0; c < 4; c++) {
+ 		mdp_wr(q + QSEED3_PHASE_INIT_Y_H + 4 * c, 0);
+ 	}
+-	uint32_t step_x = (uint32_t)(((uint64_t)mdp_src_w << PHASE_STEP_SHIFT) / mdp_dst_w);
+-	uint32_t step_y = (uint32_t)(((uint64_t)mdp_src_h << PHASE_STEP_SHIFT) / mdp_dst_h);
+ 	mdp_wr(q + QSEED3_PHASE_STEP_Y_H, step_x);
+ 	mdp_wr(q + QSEED3_PHASE_STEP_Y_V, step_y);
+ 	mdp_wr(q + QSEED3_PHASE_STEP_UV_H, step_x);
+ 	mdp_wr(q + QSEED3_PHASE_STEP_UV_V, step_y);
+ 	mdp_wr(q + QSEED3_PRELOAD, QSEED3_PRELOAD_DEFAULT);
+-	mdp_wr(q + QSEED3_SRC_SIZE_Y_RGB_A, (mdp_src_h << 16) | mdp_src_w);
+-	mdp_wr(q + QSEED3_SRC_SIZE_UV, (mdp_src_h << 16) | mdp_src_w);
+-	mdp_wr(q + QSEED3_DST_SIZE, (mdp_dst_h << 16) | mdp_dst_w);
++	mdp_wr(q + QSEED3_SRC_SIZE_Y_RGB_A, (mdp_src_h << 16) | pp->src_w);
++	mdp_wr(q + QSEED3_SRC_SIZE_UV, (mdp_src_h << 16) | pp->src_w);
++	mdp_wr(q + QSEED3_DST_SIZE, (mdp_dst_h << 16) | pp->out_w);
+ 	mdp_wr(q + QSEED3_OP_MODE, QSEED3_OP_MODE_RGB_BIL);
+-
+-	/* stage: the splash pipe's slot in lm_0 goes to our pipe, the rows the
+-	 * output does not cover come from the mixer's border colour (black) */
+-	uint32_t layer[4] = {
+-		mdp_rd(mdp_ctl + CTL_LAYER0), mdp_rd(mdp_ctl + CTL_LAYER0_EXT),
+-		mdp_rd(mdp_ctl + CTL_LAYER0_EXT2), mdp_rd(mdp_ctl + CTL_LAYER0_EXT3),
+-	};
+-	if (mdp_pipe != mdp_splash_pipe) {
+-		uint8_t oreg = mdp_pipe_tbl[mdp_splash_pipe].reg, oshift = mdp_pipe_tbl[mdp_splash_pipe].shift;
+-		uint8_t oext = mdp_pipe_tbl[mdp_splash_pipe].extbit;
+-		uint32_t stage;
+-		if (oreg == 0) {
+-			stage = (layer[0] >> oshift) & 7u;
+-			stage |= ((layer[1] >> oext) & 1u) << 3;
+-			layer[0] &= ~(7u << oshift);
+-			layer[1] &= ~(1u << oext);
+-		} else {
+-			stage = (layer[2] >> oshift) & 0xfu;
+-			layer[2] &= ~(0xfu << oshift);
+-		}
+-		layer[0] = (layer[0] & ~7u) | (stage & 7u);
+-		layer[1] = (layer[1] & ~1u) | ((stage >> 3) & 1u);
+-		flush |= 1u << mdp_pipe_tbl[mdp_splash_pipe].flush;
+-	}
+-	if (mdp_dst_w < mdp_fb_w || mdp_dst_h < mdp_fb_h) {
+-		mdp_wr(mdp_lm + LM_BORDER_COLOR_0, 0);
+-		mdp_wr(mdp_lm + LM_BORDER_COLOR_1, 0);
+-		layer[0] |= CTL_MIXER_BORDER_OUT;
+-	}
+-	mdp_wr(mdp_ctl + CTL_LAYER0, layer[0]);
+-	mdp_wr(mdp_ctl + CTL_LAYER0_EXT, layer[1]);
+-	mdp_wr(mdp_ctl + CTL_LAYER0_EXT2, layer[2]);
+-	mdp_wr(mdp_ctl + CTL_LAYER0_EXT3, layer[3]);
+-	mdp_wr(mdp_ctl + CTL_FLUSH, flush);
+-	printf("SWEET MDP: pipe %d shows 0x%llx stride %u: layer0 0x%08x ext 0x%08x ext2 0x%08x flush 0x%08x op 0x%08x scaler op 0x%08x step %u %u\n",
+-	    mdp_pipe, phys, stride, layer[0], layer[1], layer[2], flush, mdp_rd(p + SSPP_SRC_OP_MODE),
+-	    mdp_rd(q + QSEED3_OP_MODE), mdp_rd(q + QSEED3_PHASE_STEP_Y_H), mdp_rd(q + QSEED3_PHASE_STEP_Y_V));
+ }
+ 
+-/* point the pipe at a logical-size buffer (physical, already cleaned) */
++/* point the pipes at a logical-size buffer (physical, already cleaned) */
+ void
+ sweet_mdp_show(uint64_t phys, uint32_t stride)
+ {
+-	if (mdp_pipe < 0 || (phys == mdp_shown && stride == mdp_shown_stride)) {
++	if (mdp_npipes == 0 || (phys == mdp_shown && stride == mdp_shown_stride)) {
+ 		return;
+ 	}
++	if (phys < mdp_smmu.ram_base || phys - mdp_smmu.ram_base >= mdp_smmu.ram_size) {
++		if (mdp_show_logged < 4) {
++			mdp_show_logged++;
++			printf("SWEET MDP: 0x%llx is outside the window, not shown\n", phys);
++		}
++		return;
++	}
++	uint32_t iova = (uint32_t)(phys - mdp_smmu.ram_base), flush = 0;
+ 	if (mdp_shown == 0) {
+-		mdp_program(phys, stride);
++		/* the splash goes first: with translation on its address means
++		 * something else, the next frame already fetches the surface */
++		sweet_smmu_translate(&mdp_smmu);
++		for (int i = 0; i < mdp_npipes; i++) {
++			mdp_program(&mdp_pipes[i], iova, stride);
++			flush |= 1u << mdp_flush_tbl[mdp_pipes[i].idx];
++		}
+ 	} else {
+-		uint32_t p = mdp_sspp[mdp_pipe];
+-		if (stride != mdp_shown_stride) {
+-			mdp_wr(p + SSPP_SRC_YSTRIDE0, stride);
++		for (int i = 0; i < mdp_npipes; i++) {
++			uint32_t p = mdp_sspp[mdp_pipes[i].idx];
++			if (stride != mdp_shown_stride) {
++				mdp_wr(p + SSPP_SRC_YSTRIDE0, stride);
++			}
++			mdp_wr(p + SSPP_SRC0_ADDR, iova);
++			flush |= 1u << mdp_flush_tbl[mdp_pipes[i].idx];
+ 		}
+-		mdp_wr(p + SSPP_SRC0_ADDR, (uint32_t)phys);
+-		mdp_wr(mdp_ctl + CTL_FLUSH, 1u << mdp_pipe_tbl[mdp_pipe].flush);
++	}
++	mdp_wr(mdp_ctl + CTL_FLUSH, flush);
++	if (mdp_show_logged < 4) {
++		mdp_show_logged++;
++		uint32_t p = mdp_sspp[mdp_pipes[0].idx];
++		printf("SWEET MDP: showing 0x%llx (iova 0x%08x) stride %u, flush 0x%08x, vig%d op 0x%08x scaler op 0x%08x step %u %u\n",
++		    phys, iova, stride, flush, mdp_pipes[0].idx, mdp_rd(p + SSPP_SRC_OP_MODE),
++		    mdp_rd(p + mdp_qseed + QSEED3_OP_MODE), mdp_rd(p + mdp_qseed + QSEED3_PHASE_STEP_Y_H),
++		    mdp_rd(p + mdp_qseed + QSEED3_PHASE_STEP_Y_V));
+ 	}
+ 	mdp_shown = phys;
+ 	mdp_shown_stride = stride;
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index ae9af25..d841d5d 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -1,20 +1,26 @@
+ /*
+- * SMMUv2 (Linux arm-smmu.c, arm-smmu-regs.h) identity context for one stream.
+- * ABL leaves a device's stream matched to its own translation context; a DMA
+- * to our memory through those stale tables stalls the bus and resets the SoC.
+- * S2CR bypass is not available: TrustZone turns a non-secure bypass request
+- * into a fault (type 2 reads back). What the downstream driver calls an
+- * S1-bypass domain works: a context bank of our own with translation
+- * disabled, which is an identity mapping. Used by the usb and mdp drivers.
++ * SMMUv2 (Linux arm-smmu.c, arm-smmu-regs.h, io-pgtable-arm.c). ABL leaves a
++ * device's stream matched to its own translation context; a DMA to our
++ * memory through those stale tables stalls the bus and resets the SoC. S2CR
++ * bypass is not available: TrustZone turns a non-secure bypass request into
++ * a fault (type 2 reads back). What the downstream driver calls an S1-bypass
++ * domain works: a context bank of our own with translation disabled, which
++ * is an identity mapping. Devices with 32-bit address registers (the mdp)
++ * cannot reach the kernel's RAM above 4 GB that way, they get a bank with
++ * real tables: iova x -> ram_base + x in 2 MB blocks (4 KB granule, 4 GB
++ * space, level 1 with four level 2 tables).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include "sweet_smmu.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-int sweet_smmu_identity(const char *tag, uint64_t pa, uint32_t sid);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define SMMU_SCR0           0x000
+ #define   SCR0_CLIENTPD     (1u << 0)
+@@ -44,9 +50,32 @@ int sweet_smmu_identity(const char *tag, uint64_t pa, uint32_t sid);
+ #define SMMU_GR1_CBA2R(n)   (0x800u + 4u * (n))
+ #define   CBA2R_VA64        (1u << 0)
+ #define SMMU_CB_SCTLR       0x000
++#define   SCTLR_M           (1u << 0)
++#define   SCTLR_TRE         (1u << 1)
++#define   SCTLR_AFE         (1u << 2)
+ #define   SCTLR_CFRE        (1u << 5)
+ #define   SCTLR_CFIE        (1u << 6)
+ #define   SCTLR_CFCFG       (1u << 7)
++#define   SCTLR_HUPCF       (1u << 8)
++#define SMMU_CB_TCR2        0x010
++#define SMMU_CB_TTBR0       0x020   /* 64-bit */
++#define SMMU_CB_TCR         0x030
++#define SMMU_CB_MAIR0       0x038
++#define SMMU_CB_MAIR1       0x03c
++#define SMMU_CB_FSR         0x058
++#define SMMU_CB_FAR         0x060   /* 64-bit */
++/* 4 GB input (T0SZ 32), walks non-cacheable and outer shareable, 4 KB
++ * granule, no TTBR1. TCR2: 40-bit output, upstream sign extension, 16-bit asid */
++#define TCR_WINDOW          (32u | (2u << 12) | (1u << 23))
++#define TCR2_WINDOW         (2u | (1u << 4) | (7u << 15))
++#define MAIR0_NC            0x44u   /* attr index 0: normal non-cacheable */
++#define PTE_TABLE           3ull
++/* block: valid, attr 0, unprivileged access, outer shareable, accessed */
++#define PTE_BLOCK           (1ull | (1ull << 6) | (2ull << 8) | (1ull << 10))
++#define WINDOW_L1_ENTRIES   4u      /* 1 GB each */
++#define WINDOW_L2_ENTRIES   512u    /* 2 MB each */
++#define WINDOW_BLOCK        (2ull << 20)
++#define WINDOW_TABLE_BYTES  (WINDOW_L2_ENTRIES * 8)
+ 
+ static uint32_t
+ smmu_rd(vm_offset_t base, uint32_t off)
+@@ -63,11 +92,69 @@ smmu_wr(vm_offset_t base, uint32_t off, uint32_t val)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
+-/* 0 when the stream now goes through an identity context, else -1 (logged) */
++static void
++smmu_wr64(vm_offset_t base, uint32_t off, uint64_t val)
++{
++	*(volatile uint64_t *)(base + off) = val;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++smmu_tlb_sync(vm_offset_t smmu)
++{
++	smmu_wr(smmu, SMMU_TLBIALLNSNH, 0);
++	smmu_wr(smmu, SMMU_STLBGSYNC, 0);
++	for (unsigned i = 0; i < 10000 && (smmu_rd(smmu, SMMU_STLBGSTATUS) & 1u); i++) {
++		delay(1);
++	}
++}
++
++/* the walker reads the tables from memory, so they are cleaned out of the caches */
++static void
++smmu_clean(const void *va, size_t len)
++{
++	uint64_t ctr;
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r" (ctr));
++	uintptr_t line = 4u << ((ctr >> 16) & 0xf);
++	uintptr_t p = (uintptr_t)va & ~(line - 1), end = (uintptr_t)va + len;
++	for (; p < end; p += line) {
++		__asm__ volatile ("dc cvac, %0" :: "r" (p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* level 1 in the first page, the four level 2 tables in the second (16 KB pages) */
++static uint64_t
++smmu_window_tables(const char *tag, uint64_t ram_base, uint64_t ram_size)
++{
++	vm_offset_t va = 0;
++	if (kmem_alloc_contig(kernel_map, &va, 2 * PAGE_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("%s: SMMU: no memory for page tables\n", tag);
++		return 0;
++	}
++	uint64_t l1_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va));
++	uint64_t l2_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va + PAGE_SIZE));
++	uint64_t *l1 = (uint64_t *)va, *l2 = (uint64_t *)(va + PAGE_SIZE);
++	if (l1_pa == 0 || l2_pa == 0 || PAGE_SIZE < WINDOW_L1_ENTRIES * WINDOW_TABLE_BYTES) {
++		return 0;
++	}
++	for (unsigned i = 0; i < WINDOW_L1_ENTRIES; i++) {
++		l1[i] = (l2_pa + i * WINDOW_TABLE_BYTES) | PTE_TABLE;
++	}
++	for (uint64_t off = 0; off < ram_size && off < WINDOW_L1_ENTRIES * WINDOW_L2_ENTRIES * WINDOW_BLOCK; off += WINDOW_BLOCK) {
++		l2[off / WINDOW_BLOCK] = (ram_base + off) | PTE_BLOCK;
++	}
++	smmu_clean(l1, 2 * PAGE_SIZE);
++	return l1_pa;
++}
++
+ int
+-sweet_smmu_identity(const char *tag, uint64_t pa, uint32_t sid)
++sweet_smmu_attach(struct sweet_smmu_ctx *c, const char *tag, uint64_t smmu_pa, uint32_t sid,
++    uint64_t ram_base, uint64_t ram_size)
+ {
+-	vm_offset_t smmu = ml_io_map((vm_offset_t)pa, 0x100000);
++	c->cb = 0;
++	vm_offset_t smmu = ml_io_map((vm_offset_t)smmu_pa, 0x100000);
+ 	if (smmu == 0) {
+ 		return -1;
+ 	}
+@@ -125,10 +212,30 @@ sweet_smmu_identity(const char *tag, uint64_t pa, uint32_t sid)
+ 		printf("%s: SMMU has no free context bank\n", tag);
+ 		return -1;
+ 	}
+-	/* stage 1 bank with translation off = identity, stage 2 bypassed */
++	c->base = smmu;
++	c->cb = cb_base + (unsigned)cb * pagesize;
++	c->ram_base = ram_base;
++	c->ram_size = ram_size;
++	/* stage 1 bank, stage 2 bypassed, translation off for now (identity). an
++	 * identity bank stalls on faults so a bad dma shows up in the log before
++	 * the bus resets, the window bank terminates them (the mdp keeps running) */
++	c->sctlr = SCTLR_CFIE | SCTLR_CFRE | (ram_size != 0 ? SCTLR_HUPCF | SCTLR_TRE | SCTLR_AFE : SCTLR_CFCFG);
+ 	smmu_wr(gr1, SMMU_GR1_CBA2R((unsigned)cb), CBA2R_VA64);
+ 	smmu_wr(gr1, SMMU_GR1_CBAR((unsigned)cb), CBAR_S1_TRANS_S2_BYPASS | CBAR_S1_BPSHCFG_NSH | CBAR_S1_MEMATTR_WB);
+-	smmu_wr(cb_base + (unsigned)cb * pagesize, SMMU_CB_SCTLR, SCTLR_CFCFG | SCTLR_CFIE | SCTLR_CFRE);
++	if (ram_size != 0) {
++		uint64_t ttbr = smmu_window_tables(tag, ram_base, ram_size);
++		if (ttbr == 0) {
++			c->cb = 0;
++			return -1;
++		}
++		smmu_wr(c->cb, SMMU_CB_TCR2, TCR2_WINDOW);
++		smmu_wr(c->cb, SMMU_CB_TCR, TCR_WINDOW);
++		smmu_wr64(c->cb, SMMU_CB_TTBR0, ttbr);
++		smmu_wr(c->cb, SMMU_CB_MAIR0, MAIR0_NC);
++		smmu_wr(c->cb, SMMU_CB_MAIR1, 0);
++		smmu_wr(c->cb, SMMU_CB_FSR, 0xffffffffu);
++	}
++	smmu_wr(c->cb, SMMU_CB_SCTLR, c->sctlr);
+ 	if (group >= 0) {
+ 		uint32_t s2cr = smmu_rd(smmu, SMMU_S2CR(group));
+ 		smmu_wr(smmu, SMMU_S2CR(group), (s2cr & ~(S2CR_TYPE_MASK | S2CR_CBNDX_MASK)) | (uint32_t)cb);
+@@ -142,14 +249,21 @@ sweet_smmu_identity(const char *tag, uint64_t pa, uint32_t sid)
+ 			smmu_wr(smmu, SMMU_SMR(group), SMR_VALID | sid);
+ 		}
+ 	}
+-	smmu_wr(smmu, SMMU_TLBIALLNSNH, 0);
+-	smmu_wr(smmu, SMMU_STLBGSYNC, 0);
+-	for (unsigned i = 0; i < 10000 && (smmu_rd(smmu, SMMU_STLBGSTATUS) & 1u); i++) {
+-		delay(1);
+-	}
+-	printf("%s: SMMU group %d -> context bank %d: SMR 0x%08x S2CR 0x%08x CBAR 0x%08x SCTLR 0x%08x (identity)\n",
++	smmu_tlb_sync(smmu);
++	printf("%s: SMMU group %d -> context bank %d: SMR 0x%08x S2CR 0x%08x CBAR 0x%08x SCTLR 0x%08x (%s)\n",
+ 	    tag, group, cb, smmu_rd(smmu, SMMU_SMR(group)), smmu_rd(smmu, SMMU_S2CR(group)),
+-	    smmu_rd(gr1, SMMU_GR1_CBAR((unsigned)cb)), smmu_rd(cb_base + (unsigned)cb * pagesize, SMMU_CB_SCTLR));
++	    smmu_rd(gr1, SMMU_GR1_CBAR((unsigned)cb)), smmu_rd(c->cb, SMMU_CB_SCTLR),
++	    ram_size != 0 ? "window ready, identity until translate" : "identity");
+ 	return 0;
+ }
++
++void
++sweet_smmu_translate(struct sweet_smmu_ctx *c)
++{
++	if (c->cb == 0 || c->ram_size == 0) {
++		return;
++	}
++	smmu_wr(c->cb, SMMU_CB_SCTLR, c->sctlr | SCTLR_M);
++	smmu_tlb_sync(c->base);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_smmu.h b/bsd/dev/sweet_smmu.h
+new file mode 100644
+index 0000000..b017724
+--- /dev/null
++++ b/bsd/dev/sweet_smmu.h
+@@ -0,0 +1,28 @@
++/*
++ * SMMUv2 context of our own for one device stream (sweet_smmu.c): an
++ * identity context (translation off), or one with a linear window over the
++ * kernel's RAM for devices whose address registers are 32 bits wide.
++ */
++#ifndef _SWEET_SMMU_H
++#define _SWEET_SMMU_H
++
++#include <stdint.h>
++#include <mach/vm_types.h>
++
++struct sweet_smmu_ctx {
++	vm_offset_t base;       /* mapped SMMU */
++	vm_offset_t cb;         /* mapped context bank, 0 when attach failed */
++	uint64_t ram_base;      /* window: iova 0 is this physical address */
++	uint64_t ram_size;
++	uint32_t sctlr;         /* the bank's SCTLR without M */
++};
++
++/* point the stream at a context bank of ours: identity when ram_size is 0,
++ * else page tables that map iova [0, ram_size) to [ram_base, ...) are
++ * built and installed with translation still off. 0 on success */
++int sweet_smmu_attach(struct sweet_smmu_ctx *c, const char *tag, uint64_t smmu_pa, uint32_t sid,
++    uint64_t ram_base, uint64_t ram_size);
++/* turn the window on (SCTLR.M), from then on the device uses iovas */
++void sweet_smmu_translate(struct sweet_smmu_ctx *c);
++
++#endif /* _SWEET_SMMU_H */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b243bea..a5b6522 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -39,7 +39,7 @@
+ #include <sys/kern_event.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-extern int sweet_smmu_identity(const char *tag, uint64_t pa, uint32_t sid);
++#include "sweet_smmu.h"
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -202,8 +202,9 @@ hsphy_rmw(vm_offset_t phy, uint32_t off, uint32_t mask, uint32_t val)
+ static void
+ usb_smmu_bypass(void)
+ {
++	struct sweet_smmu_ctx ctx;
+ 	if (usb_smmu_pa != 0) {
+-		sweet_smmu_identity("SWEET USB", usb_smmu_pa, usb_smmu_sid);
++		sweet_smmu_attach(&ctx, "SWEET USB", usb_smmu_pa, usb_smmu_sid, 0, 0);
+ 	}
+ }
+ 
