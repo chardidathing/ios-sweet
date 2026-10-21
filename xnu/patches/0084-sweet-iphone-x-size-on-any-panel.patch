@@ -1,0 +1,47 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..293e729 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -75,7 +75,8 @@ enum {
+  * screens (UIKit: "No status bar visual provider for screen", the red
+  * rdar://45025538 bar for 360x800 points). The display is therefore
+  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+- * centered 1080x2400 part of it is shown on the 1080x2400 panel.
++ * part of it that fits is shown centered on the panel (1080x2400 on sweet,
++ * 1096x2560 on pdx203: there the panel's top and bottom rows stay black).
+  * Boot-arg sweetfb_native=1 presents the real panel size instead.
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+@@ -170,7 +171,7 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
++	if (!native) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..ec04ab8 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -433,11 +433,15 @@ SweetHIDTouch::start(IOService *provider)
+ 		return false;
+ 	}
+ 	int native = 0;
++	PE_Video video;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	/* Panel size from the boot framebuffer, as SweetFramebuffer.cpp sees it. */
++	PE_current_console(&video);
++	int panelW = (int)video.v_width, panelH = (int)video.v_height;
++	fLogicalW = native ? panelW : 1125;
++	fLogicalH = native ? panelH : 2436;
++	fOffX = (fLogicalW - panelW) / 2;
++	fOffY = (fLogicalH - panelH) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
