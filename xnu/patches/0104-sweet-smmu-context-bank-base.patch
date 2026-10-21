@@ -1,0 +1,14 @@
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index d841d5d..885310d 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -162,7 +162,8 @@ sweet_smmu_attach(struct sweet_smmu_ctx *c, const char *tag, uint64_t smmu_pa, u
+ 	unsigned nsmr = IDR0_NUMSMRG(idr0), numcb = IDR1_NUMCB(idr1), nums2cb = IDR1_NUMS2CB(idr1);
+ 	bool exids = (idr0 & IDR0_EXIDS) != 0;
+ 	uint32_t pagesize = (idr1 & IDR1_PAGESIZE_64K) ? 0x10000u : 0x1000u;
+-	uint32_t size = (1u << (IDR1_NUMPAGENDXB(idr1) + 1)) * pagesize;
++	/* NUMPAGENDXB sizes the global space, the context banks are as much again after it */
++	uint32_t size = 2u * (1u << (IDR1_NUMPAGENDXB(idr1) + 1)) * pagesize;
+ 	vm_offset_t gr1 = smmu + pagesize, cb_base = smmu + size / 2;
+ 	printf("%s: SMMU sCR0 0x%08x IDR0 0x%08x IDR1 0x%08x: %u stream match groups, %u context banks (%u stage 2), page %#x, size %#x%s%s\n",
+ 	    tag, scr0, idr0, idr1, nsmr, numcb, nums2cb, pagesize, size,
