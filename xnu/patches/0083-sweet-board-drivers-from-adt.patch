@@ -1,0 +1,210 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index a148608..8d01664 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -1,6 +1,13 @@
+ /*
+  * Minimal polled SWEET keys. Call once after the scheduler is running.
+- * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
++ * The board's PMIC wiring comes from the ADT node /sweet-keys (mkadt.py):
++ *   pon-ppid    SPMI PPID of the PON block (power key = RT status bit 0,
++ *               RESIN = bit 1)
++ *   gpio-ppid   PPID of the PMIC GPIO block that carries a volume key
++ *   gpio-base   register base of that GPIO (status at +0x10, active low)
++ *   gpio-key    which key the GPIO is, 1 = volume up, 2 = volume down
++ *   resin-key   which key RESIN is, 1 or 2
++ * sweet: volume-up is PM6150L SID 4 GPIO2, RESIN is volume-down.
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
+  */
+@@ -12,6 +19,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -21,11 +29,11 @@ void sweet_keys_init(void);
+ #define KEYS_OBS_PA      0x0e600000u
+ #define KEYS_CNFG_PA     0x0c40a000u
+ #define KEYS_PON_RT      0x0810u
+-#define KEYS_GPIO_RT     0xc110u
+ #define KEYS_NO_APID     0xffffu
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
++static uint32_t keys_gpio_base, keys_gpio_key, keys_resin_key;
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
+@@ -90,6 +98,18 @@ keys_wait(void)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++static uint32_t
++keys_prop(DTEntry node, const char *name, uint32_t fallback)
++{
++	uint32_t const *val;
++	unsigned int size;
++	if (SecureDTGetProperty(node, name, (void const **)&val, &size) == kSuccess &&
++	    size == sizeof(*val)) {
++		return *val;
++	}
++	return fallback;
++}
++
+ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+@@ -100,8 +120,10 @@ keys_thread(void *arg, wait_result_t result)
+ 	for (;;) {
+ 		uint8_t pon = 0, gpio = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
++		bool gok = keys_read(keys_gpio_apid, keys_gpio_base + 0x10u, &gpio);
++		int now[3] = {!!(pon & 1u), 0, 0};
++		now[keys_gpio_key] = !(gpio & 1u);
++		now[keys_resin_key] = !!(pon & 2u);
+ 		if (!pok || !gok) {
+ 			if ((errors++ % 250u) == 0) {
+ 				printf("SWEET KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
+@@ -111,9 +133,9 @@ keys_thread(void *arg, wait_result_t result)
+ 			errors = 0;
+ 		}
+ 		for (int k = 0; k < 3; ++k) {
+-			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
++			if ((k == (int)keys_gpio_key ? gok : pok) && now[k] != state[k]) {
+ 				state[k] = now[k];
+-				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
++				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio=%#x\n",
+ 				    k, state[k], pon, gpio);
+ 				sweet_hid_key(k, state[k]);
+ 			}
+@@ -136,6 +158,22 @@ sweet_keys_init(void)
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+ 		return;
+ 	}
++	DTEntry node;
++	if (SecureDTLookupEntry(NULL, "/sweet-keys", &node) != kSuccess) {
++		printf("SWEET KEYS: no /sweet-keys node; disabled\n");
++		return;
++	}
++	uint32_t pon_ppid = keys_prop(node, "pon-ppid", 0x008);
++	uint32_t gpio_ppid = keys_prop(node, "gpio-ppid", 0);
++	keys_gpio_base = keys_prop(node, "gpio-base", 0);
++	keys_gpio_key = keys_prop(node, "gpio-key", 1);
++	keys_resin_key = keys_prop(node, "resin-key", 2);
++	if (keys_gpio_key < 1 || keys_gpio_key > 2 || keys_resin_key < 1 ||
++	    keys_resin_key > 2 || keys_gpio_key == keys_resin_key) {
++		printf("SWEET KEYS: bad /sweet-keys key mapping gpio=%u resin=%u\n",
++		    keys_gpio_key, keys_resin_key);
++		return;
++	}
+ 	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+ 	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+ 	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
+@@ -151,22 +189,23 @@ sweet_keys_init(void)
+ 		    keys_version, count);
+ 		return;
+ 	}
+-	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
++	keys_pon_apid = keys_find_apid((uint16_t)pon_ppid, count);
++	keys_gpio_apid = gpio_ppid ? keys_find_apid((uint16_t)gpio_ppid, count) : KEYS_NO_APID;
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+-	    keys_version, count, keys_pon_apid, keys_gpio_apid,
++	bool gok = keys_read(keys_gpio_apid, keys_gpio_base + 0x10u, &gpio);
++	bool mok = keys_read(keys_gpio_apid, keys_gpio_base + 0x40u, &mode);
++	bool eok = keys_read(keys_gpio_apid, keys_gpio_base + 0x46u, &en);
++	bool sok = keys_read(keys_gpio_apid, keys_gpio_base + 0x05u, &subtype);
++	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio-apid=%u (ppid %#x base %#x) pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
++	    keys_version, count, keys_pon_apid, keys_gpio_apid, gpio_ppid, keys_gpio_base,
+ 	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+ 	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+ 	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+ 	    mode & 3u : (mode >> 4) & 7u;
+ 	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
++		printf("SWEET KEYS: gpio not confirmed enabled as input; key %u withheld, PMIC unchanged\n",
++		    keys_gpio_key);
+ 		keys_gpio_apid = KEYS_NO_APID;
+ 	}
+ 	if (!pok && !gok) {
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 03defe6..a63eb31 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -14,6 +14,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -644,6 +645,12 @@ sweet_touch_init(void)
+ 		return;
+ 	}
+ 	st.started = true;
++	/* The GENI engine, GPIOs and rail below are sweet's: only with its ADT node. */
++	DTEntry node;
++	if (SecureDTLookupEntry(NULL, "/sweet-touch", &node) != kSuccess) {
++		printf("SWEET TOUCH: no /sweet-touch node; disabled\n");
++		return;
++	}
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+ 	if (!enabled) {
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b6c1a41..022c713 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -21,6 +21,7 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
+@@ -77,6 +78,12 @@ void
+ sweet_usb_probe(void)
+ {
+ 	int enabled = 1;
++	/* GCC, DWC3 and QUSB2 addresses below are sweet's: only with its ADT node. */
++	DTEntry node;
++	if (SecureDTLookupEntry(NULL, "/sweet-usb", &node) != kSuccess) {
++		printf("SWEET USB: no /sweet-usb node; disabled\n");
++		return;
++	}
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..500052a 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -38,13 +38,13 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetPlatformExpert;"
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
+-    "     'IONameMatch'     = 'xiaomi,sweet';"
++    "     'IONameMatch'     = ('xiaomi,sweet', 'sony,pdx203');"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+-    "     'IONameMatch'     = 'qcom,kryo470';"
++    "     'IONameMatch'     = ('qcom,kryo470', 'qcom,kryo585');"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
