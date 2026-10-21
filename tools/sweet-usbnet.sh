@@ -30,10 +30,20 @@ listen_udp() {
 		ncat -l -u -k "$port"
 	elif nc -h 2>&1 | grep -q -- '-k'; then
 		nc -ukl "$port"
+	elif command -v python3 >/dev/null 2>&1; then
+		# no socat or netcat on the host, python's socket module will do
+		python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", int(sys.argv[1])))
+while True:
+    sys.stdout.buffer.write(s.recv(65536))
+    sys.stdout.buffer.flush()
+' "$port"
 	else
-		while true; do
-			nc -u -l -p "$port" 2>/dev/null || nc -u -l "$port" 2>/dev/null || break
-		done
+		echo "no socat, ncat, nc or python3 to listen on udp/$port" >&2
+		exit 1
 	fi
 }
 
