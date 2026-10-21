@@ -1,0 +1,169 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index c38267b..a0edbca 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -76,10 +76,13 @@ static uint64_t usb_dwc3_pa, usb_qscratch_pa, usb_qusb2_pa;
+  * register that means the debugger owns the PHY, and the DT parameter
+  * override sequence (value, offset pairs). */
+ static uint64_t usb_hsphy_pa, usb_eud_pa;
+-/* GCC mux feeding the USB3 pipe clock: with the SuperSpeed PHY down the
+- * pipe branch only runs from the XO leg (pipe-mux register, pipe-mux-xo
+- * selector), and the DWC3 core needs that clock for endpoint commands. */
+-static uint32_t usb_pipe_mux, usb_pipe_mux_xo;
++/* USB3 QMP PHY (kona): its PLL is the DWC3 pipe clock. Register base, the
++ * two GCC BCRs (global, phy), the control register offsets in the Linux
++ * enum order (phy-msm-ssusb-qmp.c) and the init table from the DT. */
++static uint64_t usb_ssphy_pa;
++static uint32_t usb_ssphy_reset[2], usb_ssphy_reg[15];
++static uint32_t const *usb_ssphy_seq;
++static unsigned usb_ssphy_nseq;
+ static uint32_t usb_hsphy_reset, usb_hsphy_override[8], usb_hsphy_noverride;
+ 
+ #define DWC3_SIZE               0x0000d000
+@@ -113,12 +116,20 @@ usb_config(DTEntry node)
+ 	if (SecureDTGetProperty(node, "qusb2", &prop, &size) == kSuccess && size == 8) {
+ 		memcpy(&usb_qusb2_pa, prop, 8);
+ 	}
+-	usb_pipe_mux = usb_pipe_mux_xo = 0;
+-	if (SecureDTGetProperty(node, "pipe-mux", (void const **)&val, &size) == kSuccess && size == 4) {
+-		usb_pipe_mux = *val;
+-		if (SecureDTGetProperty(node, "pipe-mux-xo", (void const **)&val, &size) == kSuccess && size == 4) {
+-			usb_pipe_mux_xo = *val;
++	usb_ssphy_pa = 0;
++	if (SecureDTGetProperty(node, "ssphy", &prop, &size) == kSuccess && size == 8) {
++		memcpy(&usb_ssphy_pa, prop, 8);
++		if (SecureDTGetProperty(node, "ssphy-reset", &prop, &size) != kSuccess || size != 8 ||
++		    SecureDTGetProperty(node, "ssphy-reg", (void const **)&val, &size) != kSuccess || size != sizeof(usb_ssphy_reg)) {
++			return false;
++		}
++		memcpy(usb_ssphy_reset, prop, 8);
++		memcpy(usb_ssphy_reg, val, sizeof(usb_ssphy_reg));
++		if (SecureDTGetProperty(node, "ssphy-seq", (void const **)&val, &size) != kSuccess || size == 0 || size % 12) {
++			return false;
+ 		}
++		usb_ssphy_seq = val; /* the device tree stays mapped */
++		usb_ssphy_nseq = size / 12;
+ 	}
+ 	usb_hsphy_pa = usb_eud_pa = 0;
+ 	usb_hsphy_noverride = 0;
+@@ -171,6 +182,95 @@ hsphy_rmw(vm_offset_t phy, uint32_t off, uint32_t mask, uint32_t val)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++/* phy-msm-ssusb-qmp.c: indexes into ssphy-reg, and the bits it writes */
++enum {
++	QMP_PCS_STATUS, QMP_AUTONOMOUS_MODE_CTRL, QMP_LFPS_RXTERM_IRQ_CLEAR, QMP_POWER_DOWN_CONTROL,
++	QMP_SW_RESET, QMP_START, QMP_PCS_MISC_TYPEC_CTRL, QMP_DP_PHY_PD_CTL, QMP_DP_COM_POWER_DOWN_CTRL,
++	QMP_DP_COM_SW_RESET, QMP_DP_COM_RESET_OVRD_CTRL, QMP_DP_COM_PHY_MODE_CTRL, QMP_DP_COM_TYPEC_CTRL,
++	QMP_DP_COM_SWI_CTRL, QMP_PCS_MISC_CLAMP_ENABLE,
++};
++#define QMP_PHYSTATUS           (1u << 6)
++#define QMP_RESET_OVRD_ALL      0xfu    /* SW_DPPHY_RESET(_MUX) | SW_USB3PHY_RESET(_MUX) */
++#define QMP_USB3_DP_COMBO_MODE  3u
++
++static void
++qmp_wr(vm_offset_t phy, unsigned reg, uint32_t val)
++{
++	*(volatile uint32_t *)(phy + usb_ssphy_reg[reg]) = val;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++gcc_bcr(vm_offset_t gcc, uint32_t off, bool assert_reset)
++{
++	uint32_t v = usb_rd(gcc, off);
++	*(volatile uint32_t *)(gcc + off) = assert_reset ? (v | 1u) : (v & ~1u);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(100);
++}
++
++/*
++ * The USB3/DP combo QMP PHY as Linux msm_ssphy_qmp_dp_combo_reset +
++ * msm_ssphy_qmp_init bring it up (USB3+DP mode, no lane select: SuperSpeed
++ * itself is not the goal, the PLL feeding the DWC3 pipe clock is). Then the
++ * pipe clock branch can run.
++ */
++static void
++usb_ssphy_init(vm_offset_t gcc)
++{
++	if (usb_ssphy_pa == 0) {
++		return;
++	}
++	vm_offset_t phy = ml_io_map((vm_offset_t)usb_ssphy_pa, 0x3000);
++	if (phy == 0) {
++		return;
++	}
++	printf("SWEET USB: SS PHY before: status 0x%02x pd 0x%02x mode 0x%02x\n",
++	    usb_rd(phy, usb_ssphy_reg[QMP_PCS_STATUS]), usb_rd(phy, usb_ssphy_reg[QMP_POWER_DOWN_CONTROL]),
++	    usb_rd(phy, usb_ssphy_reg[QMP_DP_COM_PHY_MODE_CTRL]));
++	/* global reset held while the PHY reset pulses */
++	gcc_bcr(gcc, usb_ssphy_reset[0], true);
++	gcc_bcr(gcc, usb_ssphy_reset[1], true);
++	gcc_bcr(gcc, usb_ssphy_reset[1], false);
++	gcc_bcr(gcc, usb_ssphy_reset[0], false);
++	/* power up, override both PHY resets, combo mode, release the override */
++	qmp_wr(phy, QMP_DP_COM_POWER_DOWN_CTRL, 1);
++	qmp_wr(phy, QMP_POWER_DOWN_CONTROL, 1);
++	qmp_wr(phy, QMP_DP_COM_RESET_OVRD_CTRL, QMP_RESET_OVRD_ALL);
++	qmp_wr(phy, QMP_DP_COM_PHY_MODE_CTRL, QMP_USB3_DP_COMBO_MODE);
++	(void)usb_rd(phy, usb_ssphy_reg[QMP_DP_COM_PHY_MODE_CTRL]);
++	qmp_wr(phy, QMP_DP_COM_RESET_OVRD_CTRL, 0);
++	qmp_wr(phy, QMP_DP_COM_POWER_DOWN_CTRL, 1);
++	qmp_wr(phy, QMP_POWER_DOWN_CONTROL, 1);
++	for (unsigned i = 0; i < usb_ssphy_nseq; i++) {
++		*(volatile uint32_t *)(phy + usb_ssphy_seq[3 * i]) = usb_ssphy_seq[3 * i + 1];
++		__asm__ volatile ("dsb sy" ::: "memory");
++		if (usb_ssphy_seq[3 * i + 2]) {
++			delay(usb_ssphy_seq[3 * i + 2] + 10);
++		}
++	}
++	qmp_wr(phy, QMP_DP_COM_SW_RESET, 0);
++	qmp_wr(phy, QMP_SW_RESET, 0);
++	qmp_wr(phy, QMP_START, 3);
++	unsigned i;
++	for (i = 0; i < 10000 && (usb_rd(phy, usb_ssphy_reg[QMP_PCS_STATUS]) & QMP_PHYSTATUS); i++) {
++		delay(1);
++	}
++	printf("SWEET USB: SS PHY %s after %u us (status 0x%02x)\n",
++	    (usb_rd(phy, usb_ssphy_reg[QMP_PCS_STATUS]) & QMP_PHYSTATUS) ? "NOT ready" : "ready", i,
++	    usb_rd(phy, usb_ssphy_reg[QMP_PCS_STATUS]));
++	if (usb_cbcr_off[9] != 0) {
++		uint32_t v = usb_rd(gcc, usb_cbcr_off[9]);
++		*(volatile uint32_t *)(gcc + usb_cbcr_off[9]) = v | 1u;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (i = 0; i < 5000 && (usb_rd(gcc, usb_cbcr_off[9]) & CBCR_CLK_OFF); i++) {
++			delay(1);
++		}
++		printf("SWEET USB: clk phy-pipe enabled -> CBCR 0x%08x (%s)\n", usb_rd(gcc, usb_cbcr_off[9]),
++		    (usb_rd(gcc, usb_cbcr_off[9]) & CBCR_CLK_OFF) ? "still off" : "on");
++	}
++}
++
+ /*
+  * The femto HS PHY as Linux msm_hsphy_init brings it up: BCR pulse, then the
+  * register sequence with the DT parameter overrides. ABL may leave the PHY
+@@ -274,14 +374,9 @@ sweet_usb_probe(void)
+ 	/* ABL leaves branches off after a fastboot reboot (kona: the UTMI clock,
+ 	 * without which endpoint commands never complete). Turn on every
+ 	 * described branch that is off, as the Linux clock driver would. */
+-	if (usb_pipe_mux != 0) {
+-		uint32_t mux = usb_rd(gcc, usb_pipe_mux);
+-		*(volatile uint32_t *)(gcc + usb_pipe_mux) = (mux & ~3u) | (usb_pipe_mux_xo & 3u);
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		printf("SWEET USB: pipe clock mux 0x%08x -> 0x%08x (XO)\n", mux, usb_rd(gcc, usb_pipe_mux));
+-	}
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+-		if (usb_cbcr_off[i] == 0 || !(cbcr[i] & CBCR_CLK_OFF)) {
++		/* the pipe branch (index 9) only runs once the SS PHY PLL is up: see usb_ssphy_init */
++		if (usb_cbcr_off[i] == 0 || !(cbcr[i] & CBCR_CLK_OFF) || i == 9) {
+ 			continue;
+ 		}
+ 		*(volatile uint32_t *)(gcc + usb_cbcr_off[i]) = cbcr[i] | 1u;
+@@ -314,6 +409,7 @@ sweet_usb_probe(void)
+ 	    usb_rd(dwc, 0xc140));
+ 	if (enabled >= 2) {
+ 		usb_hsphy_init(gcc);
++		usb_ssphy_init(gcc);
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+ 	if (usb_qusb2_pa == 0) {
