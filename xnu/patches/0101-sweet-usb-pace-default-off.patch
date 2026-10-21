@@ -1,0 +1,24 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 3e35150..75f662f 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -76,7 +76,7 @@ static bool usb_hs_only;   /* no SuperSpeed PHY: pipe domain from the UTMI clock
+  * stream is switched to bypass before the first DMA, see usb_smmu_bypass */
+ static uint64_t usb_smmu_pa;
+ static uint32_t usb_smmu_sid;
+-static unsigned usb_pace_ms = 2000; /* bring-up step pacing, see usb_pace */
++static unsigned usb_pace_ms;        /* bring-up step pacing, see usb_pace */
+ static void usb_pace(void);
+ static uint64_t usb_dwc3_pa, usb_qscratch_pa, usb_qusb2_pa;
+ /* SNPS femto HS PHY (kona): hsphy register base, its GCC BCR, the EUD enable
+@@ -1322,8 +1322,8 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 
+ /*
+  * Bring-up pacing: the persistent log flushes about once a second and a
+- * hung bus resets the SoC within that second, so each start-up step waits
+- * for its line to reach the disk (boot-arg sweetusbpace, ms, default 2000).
++ * hung bus resets the SoC within that second, so with boot-arg sweetusbpace
++ * (ms, default 0) each start-up step waits for its line to reach the disk.
+  */
+ static int usb_pace_chan;
+ 
