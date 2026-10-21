@@ -1,0 +1,51 @@
+diff --git a/bsd/dev/sweet_geni.c b/bsd/dev/sweet_geni.c
+index d9827e5..191b956 100644
+--- a/bsd/dev/sweet_geni.c
++++ b/bsd/dev/sweet_geni.c
+@@ -99,13 +99,18 @@ sweet_geni_clocks(const char *tag, vm_offset_t gcc, uint32_t vote, uint32_t vote
+ 			return false;
+ 		}
+ 	}
++	/* A halted branch is reported, not fatal: on kona the wrapper AHB halt
++	 * bits read set with the vote in place, and the SE probe below is the
++	 * real test of whether the bus is clocked. */
++	bool all = true;
+ 	for (unsigned i = 0; i < nhalts; ++i) {
+ 		if (!sweet_mmio_wait_clear(gcc, halts[i], 1u << 31)) {
+ 			printf("%s: GCC branch %#x halted (%#x)\n", tag, halts[i],
+ 			    sweet_mmio_rd(gcc, halts[i]));
+-			return false;
++			all = false;
+ 		}
+ 	}
++	printf("%s: GCC branches %s\n", tag, all ? "running" : "not all running, probing anyway");
+ 	return true;
+ }
+ 
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 23f19bd..a95b326 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -149,6 +149,22 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
+ 		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
+ 	}
++	/* ABL leaves branches off after a fastboot reboot (kona: the UTMI clock,
++	 * without which endpoint commands never complete). Turn on every
++	 * described branch that is off, as the Linux clock driver would. */
++	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
++		if (usb_cbcr_off[i] == 0 || !(cbcr[i] & CBCR_CLK_OFF)) {
++			continue;
++		}
++		*(volatile uint32_t *)(gcc + usb_cbcr_off[i]) = cbcr[i] | 1u;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (unsigned j = 0; j < 5000 && (usb_rd(gcc, usb_cbcr_off[i]) & CBCR_CLK_OFF); j++) {
++			delay(1);
++		}
++		cbcr[i] = usb_rd(gcc, usb_cbcr_off[i]);
++		printf("SWEET USB: clk %-12s enabled -> CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
++		    (cbcr[i] & CBCR_CLK_OFF) ? "still off" : "on");
++	}
+ 	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
+ 	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
+ 	if (!clocks_on) {
