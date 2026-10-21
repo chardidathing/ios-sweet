@@ -1,0 +1,34 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 4ed66e0..fd0b95c 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -209,7 +209,7 @@ hsphy_rmw(vm_offset_t phy, uint32_t off, uint32_t mask, uint32_t val)
+ #define SMMU_IDR0           0x020
+ #define   IDR0_NUMSMRG(v)   ((v) & 0xffu)
+ #define   IDR0_EXIDS        (1u << 8)
+-#define   IDR0_SMS          (1u << 31)
++#define   IDR0_SMS          (1u << 27)  /* stream matching (bit 31 is the secure extension) */
+ #define SMMU_SMR(n)         (0x800u + 4u * (n))
+ #define   SMR_VALID         (1u << 31)
+ #define SMMU_S2CR(n)        (0xc00u + 4u * (n))
+@@ -233,7 +233,19 @@ usb_smmu_bypass(void)
+ 	printf("SWEET USB: SMMU sCR0 0x%08x IDR0 0x%08x: %u stream match groups%s%s\n", scr0, idr0, nsmr,
+ 	    (scr0 & SCR0_CLIENTPD) ? ", client port disabled (global bypass)" : "",
+ 	    (scr0 & SCR0_USFCFG) ? ", unmatched streams fault" : ", unmatched streams bypass");
+-	if ((scr0 & SCR0_CLIENTPD) || !(idr0 & IDR0_SMS) || nsmr == 0) {
++	if (scr0 & SCR0_CLIENTPD) {
++		return;
++	}
++	if (!(idr0 & IDR0_SMS)) {
++		/* stream indexing: the stream ID selects its S2CR directly */
++		uint32_t s2cr = usb_rd(smmu, SMMU_S2CR(usb_smmu_sid));
++		*(volatile uint32_t *)(smmu + SMMU_S2CR(usb_smmu_sid)) = (s2cr & ~S2CR_TYPE_MASK) | S2CR_TYPE_BYPASS;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("SWEET USB: SMMU stream 0x%x S2CR 0x%08x -> 0x%08x (bypass, stream indexing)\n",
++		    usb_smmu_sid, s2cr, usb_rd(smmu, SMMU_S2CR(usb_smmu_sid)));
++		return;
++	}
++	if (nsmr == 0) {
+ 		return;
+ 	}
+ 	int found = -1, spare = -1;
