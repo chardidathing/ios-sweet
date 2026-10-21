@@ -1,0 +1,968 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 2db462e..895166a 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,8 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_smmu.c			standard
++bsd/dev/sweet_mdp.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_mdp.c b/bsd/dev/sweet_mdp.c
+new file mode 100644
+index 0000000..1263356
+--- /dev/null
++++ b/bsd/dev/sweet_mdp.c
+@@ -0,0 +1,363 @@
++/*
++ * Present through the display processor (Qualcomm MDP, "sde" in the vendor
++ * tree). The pipe that ABL set up for the splash keeps fetching the panel
++ * buffer; here a VIG pipe (one with a QSEED3 scaler) fetches the client's
++ * logical-size surface straight from its memory and scales it to the panel,
++ * so a swap is an address write instead of a 10 MB copy. Wiring comes from
++ * the ADT node /sweet-mdp (tools/mkadt.py):
++ *   base      mdp_phys, the MDSS register block
++ *   top       MDP top block (clock controls)         sde-off
++ *   ctl, lm   ctl_0 and lm_0                         sde-ctl-off, sde-mixer-off
++ *   qseed     the scaler block inside a vig pipe       sde-vig-qseed-off
++ *   clk-ctrl, clk-bit  vig_0's clock enable in top   sde-sspp-clk-ctrl
++ *   sspp      the eight source pipes, four vig then four dma, to find
++ *             the splash pipe (its SRC0_ADDR is the panel buffer)
++ *   smmu, smmu-sid  the apps SMMU and the mdp's unsecure stream (optional,
++ *             boot-arg sweetmdp_smmu=0 leaves it alone)
++ * Register offsets from techpack/display/msm/sde/sde_hw_{sspp,ctl,util,lm}.c.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_smmu_identity(const char *tag, uint64_t pa, uint32_t sid);
++bool sweet_mdp_init(uint64_t fb_phys, uint32_t fb_w, uint32_t fb_h, uint32_t src_w, uint32_t src_h, int fit);
++void sweet_mdp_show(uint64_t phys, uint32_t stride);
++void sweet_mdp_clean(const void *va, size_t len);
++
++#define SSPP_SRC_SIZE           0x00
++#define SSPP_SRC_XY             0x08
++#define SSPP_OUT_SIZE           0x0c
++#define SSPP_OUT_XY             0x10
++#define SSPP_SRC0_ADDR          0x14
++#define SSPP_SRC_YSTRIDE0       0x24
++#define SSPP_SRC_FORMAT         0x30
++#define SSPP_SRC_UNPACK_PATTERN 0x34
++#define SSPP_SRC_OP_MODE        0x38
++#define   OP_PE_OVERRIDE        (1u << 31)      /* use the SW pixel extension registers */
++#define SSPP_SRC_CONSTANT_COLOR 0x3c
++#define SSPP_EXCL_REC_CTL       0x40
++#define SSPP_UBWC_STATIC_CTRL   0x44
++#define SSPP_FETCH_CONFIG       0x48
++#define SSPP_DANGER_LUT         0x60
++#define SSPP_SAFE_LUT           0x64
++#define SSPP_CREQ_LUT           0x68
++#define SSPP_QOS_CTRL           0x6c
++#define SSPP_CREQ_LUT_0         0x74
++#define SSPP_CREQ_LUT_1         0x78
++#define SSPP_DECIMATION_CONFIG  0xb4
++#define SSPP_SW_PIX_EXT_C0_LR   0x100   /* C0, then C1C2 at +0x10 and C3 at +0x20 */
++#define SSPP_SW_PIX_EXT_C0_TB   0x104
++#define SSPP_SW_PIX_EXT_C0_REQ  0x108
++#define SSPP_MULTIRECT_OPMODE   0x170
++#define QSEED3_HW_VERSION       0x00
++#define QSEED3_OP_MODE          0x04
++#define QSEED3_PHASE_STEP_Y_H   0x10
++#define QSEED3_PHASE_STEP_Y_V   0x14
++#define QSEED3_PHASE_STEP_UV_H  0x18
++#define QSEED3_PHASE_STEP_UV_V  0x1c
++#define QSEED3_PRELOAD          0x20
++#define QSEED3_SRC_SIZE_Y_RGB_A 0x40
++#define QSEED3_SRC_SIZE_UV      0x44
++#define QSEED3_DST_SIZE         0x48
++#define QSEED3_PHASE_INIT_Y_H   0x90    /* Y_V, UV_H, UV_V follow */
++#define PHASE_STEP_SHIFT        21
++/* scaler on, bilinear rgb (3) and alpha (1), alpha blending, not a DX format */
++#define QSEED3_OP_MODE_RGB_BIL  ((1u << 0) | (3u << 16) | (1u << 31) | (1u << 14) | (1u << 10) | (1u << 29))
++#define QSEED3_PRELOAD_DEFAULT  0x03040304      /* h 4, v 3, both planes */
++#define CTL_LAYER0              0x00    /* lm_0's stage config and its ext registers */
++#define CTL_LAYER0_EXT          0x40
++#define CTL_LAYER0_EXT2         0x70
++#define CTL_LAYER0_EXT3         0xa0
++#define   CTL_MIXER_BORDER_OUT  (1u << 24)
++#define CTL_TOP                 0x14
++#define CTL_FLUSH               0x18
++#define   FLUSH_LM0             (1u << 6)
++#define   FLUSH_CTL             (1u << 17)
++#define LM_OP_MODE              0x00
++#define LM_OUT_SIZE             0x04
++#define LM_BORDER_COLOR_0       0x08
++#define LM_BORDER_COLOR_1       0x10
++#define MDP_PIPES               8
++#define MDP_VIG_PIPES           4
++
++/* CTL_FLUSH bit of each pipe and where its stage lives in the lm_0 layer
++ * registers (sde_hw_ctl.c sspp_tbl and sspp_reg_cfg_tbl): the 3-bit stage
++ * field in CTL_LAYER plus its fourth bit in LAYER_EXT, or a 4-bit field in
++ * LAYER_EXT2 for dma_2/3 */
++static const struct {
++	uint8_t flush, reg, shift, extbit;
++} mdp_pipe_tbl[MDP_PIPES] = {
++	{0, 0, 0, 0}, {1, 0, 3, 2}, {2, 0, 6, 4}, {18, 0, 26, 6},
++	{11, 0, 18, 16}, {12, 0, 21, 18}, {24, 2, 0, 0xff}, {25, 2, 4, 0xff},
++};
++
++static vm_offset_t mdp_base;
++static uint32_t mdp_top, mdp_ctl, mdp_lm, mdp_qseed, mdp_clk_ctrl, mdp_clk_bit;
++static uint32_t mdp_sspp[MDP_PIPES];
++static int mdp_splash_pipe = -1;        /* index into mdp_sspp, the pipe ABL staged */
++static int mdp_pipe = -1;               /* the pipe that fetches the client surface */
++static uint32_t mdp_src_w, mdp_src_h, mdp_dst_x, mdp_dst_y, mdp_dst_w, mdp_dst_h, mdp_fb_w, mdp_fb_h;
++static uint64_t mdp_shown;              /* SRC0_ADDR now in the pipe, 0 = still the splash */
++static uint32_t mdp_shown_stride;
++
++static uint32_t
++mdp_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(mdp_base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++mdp_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(mdp_base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++mdp_prop(DTEntry node, const char *name, uint32_t *out)
++{
++	uint32_t const *val;
++	unsigned int size;
++	if (SecureDTGetProperty(node, name, (void const **)&val, &size) != kSuccess || size != sizeof(*val)) {
++		return false;
++	}
++	*out = *val;
++	return true;
++}
++
++/* the mdp is not coherent with the cpu caches, a surface is cleaned before it fetches it */
++void
++sweet_mdp_clean(const void *va, size_t len)
++{
++	uint64_t ctr;
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r" (ctr));
++	uintptr_t line = 4u << ((ctr >> 16) & 0xf);
++	uintptr_t p = (uintptr_t)va & ~(line - 1), end = (uintptr_t)va + len;
++	for (; p < end; p += line) {
++		__asm__ volatile ("dc cvac, %0" :: "r" (p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++mdp_dump(void)
++{
++	printf("SWEET MDP: hw 0x%08x ctl top 0x%08x flush 0x%08x layer0 0x%08x ext 0x%08x ext2 0x%08x ext3 0x%08x lm0 op 0x%08x out 0x%08x clk 0x%08x\n",
++	    mdp_rd(0), mdp_rd(mdp_ctl + CTL_TOP), mdp_rd(mdp_ctl + CTL_FLUSH),
++	    mdp_rd(mdp_ctl + CTL_LAYER0), mdp_rd(mdp_ctl + CTL_LAYER0_EXT), mdp_rd(mdp_ctl + CTL_LAYER0_EXT2),
++	    mdp_rd(mdp_ctl + CTL_LAYER0_EXT3), mdp_rd(mdp_lm + LM_OP_MODE), mdp_rd(mdp_lm + LM_OUT_SIZE),
++	    mdp_rd(mdp_top + mdp_clk_ctrl));
++	for (int i = 0; i < MDP_PIPES; i++) {
++		uint32_t p = mdp_sspp[i];
++		printf("SWEET MDP: %s%d addr 0x%08x src 0x%08x at 0x%08x out 0x%08x at 0x%08x stride 0x%08x fmt 0x%08x unpack 0x%08x op 0x%08x qos 0x%08x%s\n",
++		    i < MDP_VIG_PIPES ? "vig" : "dma", i < MDP_VIG_PIPES ? i : i - MDP_VIG_PIPES,
++		    mdp_rd(p + SSPP_SRC0_ADDR), mdp_rd(p + SSPP_SRC_SIZE), mdp_rd(p + SSPP_SRC_XY),
++		    mdp_rd(p + SSPP_OUT_SIZE), mdp_rd(p + SSPP_OUT_XY), mdp_rd(p + SSPP_SRC_YSTRIDE0),
++		    mdp_rd(p + SSPP_SRC_FORMAT), mdp_rd(p + SSPP_SRC_UNPACK_PATTERN), mdp_rd(p + SSPP_SRC_OP_MODE),
++		    mdp_rd(p + SSPP_QOS_CTRL), i == mdp_splash_pipe ? " (splash)" : "");
++	}
++}
++
++/*
++ * Reads the wiring and the splash setup, picks the pipe and the output
++ * rectangle. fit 0 scales the logical size to the panel width (same scale
++ * both ways, black rows above and below), fit 1 stretches it to the panel.
++ * Returns false when the node is absent or the splash pipe is not found,
++ * the caller then keeps the cpu present.
++ */
++bool
++sweet_mdp_init(uint64_t fb_phys, uint32_t fb_w, uint32_t fb_h, uint32_t src_w, uint32_t src_h, int fit)
++{
++	DTEntry node;
++	void const *prop;
++	unsigned int size;
++	uint64_t base = 0, smmu = 0;
++	uint32_t sid = 0;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-mdp", &node) != kSuccess) {
++		return false;
++	}
++	if (SecureDTGetProperty(node, "base", &prop, &size) != kSuccess || size != 8) {
++		return false;
++	}
++	memcpy(&base, prop, 8);
++	if (!mdp_prop(node, "top", &mdp_top) || !mdp_prop(node, "ctl", &mdp_ctl) || !mdp_prop(node, "lm", &mdp_lm) ||
++	    !mdp_prop(node, "qseed", &mdp_qseed) ||
++	    !mdp_prop(node, "clk-ctrl", &mdp_clk_ctrl) || !mdp_prop(node, "clk-bit", &mdp_clk_bit)) {
++		printf("SWEET MDP: /sweet-mdp is incomplete\n");
++		return false;
++	}
++	if (SecureDTGetProperty(node, "sspp", &prop, &size) != kSuccess || size != sizeof(mdp_sspp)) {
++		printf("SWEET MDP: /sweet-mdp needs %d sspp offsets\n", MDP_PIPES);
++		return false;
++	}
++	memcpy(mdp_sspp, prop, sizeof(mdp_sspp));
++	if (SecureDTGetProperty(node, "smmu", &prop, &size) == kSuccess && size == 8) {
++		memcpy(&smmu, prop, 8);
++		if (!mdp_prop(node, "smmu-sid", &sid)) {
++			smmu = 0;
++		}
++	}
++	mdp_base = ml_io_map((vm_offset_t)base, 0x90000);
++	if (mdp_base == 0) {
++		return false;
++	}
++	for (int i = 0; i < MDP_PIPES; i++) {
++		if (mdp_rd(mdp_sspp[i] + SSPP_SRC0_ADDR) == (uint32_t)fb_phys) {
++			mdp_splash_pipe = i;
++			break;
++		}
++	}
++	mdp_dump();
++	if (mdp_splash_pipe < 0) {
++		printf("SWEET MDP: no pipe fetches the splash at 0x%llx, cpu present\n", fb_phys);
++		return false;
++	}
++	/* a vig pipe has the scaler, the splash's own if it is one, else vig_0 */
++	mdp_pipe = mdp_splash_pipe < MDP_VIG_PIPES ? mdp_splash_pipe : 0;
++	mdp_fb_w = fb_w;
++	mdp_fb_h = fb_h;
++	mdp_src_w = src_w;
++	mdp_src_h = src_h;
++	if (fit == 1) {
++		mdp_dst_w = fb_w;
++		mdp_dst_h = fb_h;
++	} else {
++		mdp_dst_w = fb_w;
++		mdp_dst_h = (uint32_t)(((uint64_t)src_h * fb_w) / src_w);
++		if (mdp_dst_h > fb_h) {
++			mdp_dst_h = fb_h;
++			mdp_dst_w = (uint32_t)(((uint64_t)src_w * fb_h) / src_h);
++		}
++	}
++	mdp_dst_x = (fb_w - mdp_dst_w) / 2;
++	mdp_dst_y = (fb_h - mdp_dst_h) / 2;
++	int use_smmu = 1;
++	PE_parse_boot_argn("sweetmdp_smmu", &use_smmu, sizeof(use_smmu));
++	if (smmu != 0 && use_smmu) {
++		sweet_smmu_identity("SWEET MDP", smmu, sid);
++	}
++	printf("SWEET MDP: %s%d (scaler v0x%x) will show %ux%u as %ux%u at %u,%u on the %ux%u panel\n",
++	    mdp_pipe < MDP_VIG_PIPES ? "vig" : "dma", mdp_pipe, mdp_rd(mdp_sspp[mdp_pipe] + mdp_qseed + QSEED3_HW_VERSION),
++	    src_w, src_h, mdp_dst_w, mdp_dst_h, mdp_dst_x, mdp_dst_y, fb_w, fb_h);
++	return true;
++}
++
++/* first show: the pipe takes over the splash pipe's format, qos and stage */
++static void
++mdp_program(uint64_t phys, uint32_t stride)
++{
++	uint32_t p = mdp_sspp[mdp_pipe], old = mdp_sspp[mdp_splash_pipe], q = p + mdp_qseed;
++	uint32_t flush = (1u << mdp_pipe_tbl[mdp_pipe].flush) | FLUSH_LM0 | FLUSH_CTL;
++
++	if (mdp_pipe != mdp_splash_pipe) {
++		mdp_wr(mdp_top + mdp_clk_ctrl, mdp_rd(mdp_top + mdp_clk_ctrl) | (1u << mdp_clk_bit));
++		mdp_wr(p + SSPP_DANGER_LUT, mdp_rd(old + SSPP_DANGER_LUT));
++		mdp_wr(p + SSPP_SAFE_LUT, mdp_rd(old + SSPP_SAFE_LUT));
++		mdp_wr(p + SSPP_CREQ_LUT, mdp_rd(old + SSPP_CREQ_LUT));
++		mdp_wr(p + SSPP_CREQ_LUT_0, mdp_rd(old + SSPP_CREQ_LUT_0));
++		mdp_wr(p + SSPP_CREQ_LUT_1, mdp_rd(old + SSPP_CREQ_LUT_1));
++		mdp_wr(p + SSPP_QOS_CTRL, mdp_rd(old + SSPP_QOS_CTRL));
++		mdp_wr(p + SSPP_SRC_FORMAT, mdp_rd(old + SSPP_SRC_FORMAT));
++		mdp_wr(p + SSPP_SRC_UNPACK_PATTERN, mdp_rd(old + SSPP_SRC_UNPACK_PATTERN));
++		mdp_wr(p + SSPP_SRC_CONSTANT_COLOR, mdp_rd(old + SSPP_SRC_CONSTANT_COLOR));
++		mdp_wr(p + SSPP_EXCL_REC_CTL, mdp_rd(old + SSPP_EXCL_REC_CTL));
++		mdp_wr(p + SSPP_UBWC_STATIC_CTRL, mdp_rd(old + SSPP_UBWC_STATIC_CTRL));
++		mdp_wr(p + SSPP_FETCH_CONFIG, mdp_rd(old + SSPP_FETCH_CONFIG));
++		mdp_wr(p + SSPP_MULTIRECT_OPMODE, mdp_rd(old + SSPP_MULTIRECT_OPMODE));
++	}
++	mdp_wr(p + SSPP_SRC_OP_MODE, mdp_rd(old + SSPP_SRC_OP_MODE) | OP_PE_OVERRIDE);
++	mdp_wr(p + SSPP_SRC_SIZE, (mdp_src_h << 16) | mdp_src_w);
++	mdp_wr(p + SSPP_SRC_XY, 0);
++	mdp_wr(p + SSPP_OUT_SIZE, (mdp_dst_h << 16) | mdp_dst_w);
++	mdp_wr(p + SSPP_OUT_XY, (mdp_dst_y << 16) | mdp_dst_x);
++	mdp_wr(p + SSPP_SRC_YSTRIDE0, stride);
++	mdp_wr(p + SSPP_SRC0_ADDR, (uint32_t)phys);
++	mdp_wr(p + SSPP_DECIMATION_CONFIG, 0);
++	/* no edge extension, the scaler is told the whole source */
++	for (uint32_t c = 0; c < 3; c++) {
++		mdp_wr(p + SSPP_SW_PIX_EXT_C0_LR + 0x10 * c, 0);
++		mdp_wr(p + SSPP_SW_PIX_EXT_C0_TB + 0x10 * c, 0);
++		mdp_wr(p + SSPP_SW_PIX_EXT_C0_REQ + 0x10 * c, (mdp_src_h << 16) | mdp_src_w);
++	}
++	for (uint32_t c = 0; c < 4; c++) {
++		mdp_wr(q + QSEED3_PHASE_INIT_Y_H + 4 * c, 0);
++	}
++	uint32_t step_x = (uint32_t)(((uint64_t)mdp_src_w << PHASE_STEP_SHIFT) / mdp_dst_w);
++	uint32_t step_y = (uint32_t)(((uint64_t)mdp_src_h << PHASE_STEP_SHIFT) / mdp_dst_h);
++	mdp_wr(q + QSEED3_PHASE_STEP_Y_H, step_x);
++	mdp_wr(q + QSEED3_PHASE_STEP_Y_V, step_y);
++	mdp_wr(q + QSEED3_PHASE_STEP_UV_H, step_x);
++	mdp_wr(q + QSEED3_PHASE_STEP_UV_V, step_y);
++	mdp_wr(q + QSEED3_PRELOAD, QSEED3_PRELOAD_DEFAULT);
++	mdp_wr(q + QSEED3_SRC_SIZE_Y_RGB_A, (mdp_src_h << 16) | mdp_src_w);
++	mdp_wr(q + QSEED3_SRC_SIZE_UV, (mdp_src_h << 16) | mdp_src_w);
++	mdp_wr(q + QSEED3_DST_SIZE, (mdp_dst_h << 16) | mdp_dst_w);
++	mdp_wr(q + QSEED3_OP_MODE, QSEED3_OP_MODE_RGB_BIL);
++
++	/* stage: the splash pipe's slot in lm_0 goes to our pipe, the rows the
++	 * output does not cover come from the mixer's border colour (black) */
++	uint32_t layer[4] = {
++		mdp_rd(mdp_ctl + CTL_LAYER0), mdp_rd(mdp_ctl + CTL_LAYER0_EXT),
++		mdp_rd(mdp_ctl + CTL_LAYER0_EXT2), mdp_rd(mdp_ctl + CTL_LAYER0_EXT3),
++	};
++	if (mdp_pipe != mdp_splash_pipe) {
++		uint8_t oreg = mdp_pipe_tbl[mdp_splash_pipe].reg, oshift = mdp_pipe_tbl[mdp_splash_pipe].shift;
++		uint8_t oext = mdp_pipe_tbl[mdp_splash_pipe].extbit;
++		uint32_t stage;
++		if (oreg == 0) {
++			stage = (layer[0] >> oshift) & 7u;
++			stage |= ((layer[1] >> oext) & 1u) << 3;
++			layer[0] &= ~(7u << oshift);
++			layer[1] &= ~(1u << oext);
++		} else {
++			stage = (layer[2] >> oshift) & 0xfu;
++			layer[2] &= ~(0xfu << oshift);
++		}
++		layer[0] = (layer[0] & ~7u) | (stage & 7u);
++		layer[1] = (layer[1] & ~1u) | ((stage >> 3) & 1u);
++		flush |= 1u << mdp_pipe_tbl[mdp_splash_pipe].flush;
++	}
++	if (mdp_dst_w < mdp_fb_w || mdp_dst_h < mdp_fb_h) {
++		mdp_wr(mdp_lm + LM_BORDER_COLOR_0, 0);
++		mdp_wr(mdp_lm + LM_BORDER_COLOR_1, 0);
++		layer[0] |= CTL_MIXER_BORDER_OUT;
++	}
++	mdp_wr(mdp_ctl + CTL_LAYER0, layer[0]);
++	mdp_wr(mdp_ctl + CTL_LAYER0_EXT, layer[1]);
++	mdp_wr(mdp_ctl + CTL_LAYER0_EXT2, layer[2]);
++	mdp_wr(mdp_ctl + CTL_LAYER0_EXT3, layer[3]);
++	mdp_wr(mdp_ctl + CTL_FLUSH, flush);
++	printf("SWEET MDP: pipe %d shows 0x%llx stride %u: layer0 0x%08x ext 0x%08x ext2 0x%08x flush 0x%08x op 0x%08x scaler op 0x%08x step %u %u\n",
++	    mdp_pipe, phys, stride, layer[0], layer[1], layer[2], flush, mdp_rd(p + SSPP_SRC_OP_MODE),
++	    mdp_rd(q + QSEED3_OP_MODE), mdp_rd(q + QSEED3_PHASE_STEP_Y_H), mdp_rd(q + QSEED3_PHASE_STEP_Y_V));
++}
++
++/* point the pipe at a logical-size buffer (physical, already cleaned) */
++void
++sweet_mdp_show(uint64_t phys, uint32_t stride)
++{
++	if (mdp_pipe < 0 || (phys == mdp_shown && stride == mdp_shown_stride)) {
++		return;
++	}
++	if (mdp_shown == 0) {
++		mdp_program(phys, stride);
++	} else {
++		uint32_t p = mdp_sspp[mdp_pipe];
++		if (stride != mdp_shown_stride) {
++			mdp_wr(p + SSPP_SRC_YSTRIDE0, stride);
++		}
++		mdp_wr(p + SSPP_SRC0_ADDR, (uint32_t)phys);
++		mdp_wr(mdp_ctl + CTL_FLUSH, 1u << mdp_pipe_tbl[mdp_pipe].flush);
++	}
++	mdp_shown = phys;
++	mdp_shown_stride = stride;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+new file mode 100644
+index 0000000..ae9af25
+--- /dev/null
++++ b/bsd/dev/sweet_smmu.c
+@@ -0,0 +1,155 @@
++/*
++ * SMMUv2 (Linux arm-smmu.c, arm-smmu-regs.h) identity context for one stream.
++ * ABL leaves a device's stream matched to its own translation context; a DMA
++ * to our memory through those stale tables stalls the bus and resets the SoC.
++ * S2CR bypass is not available: TrustZone turns a non-secure bypass request
++ * into a fault (type 2 reads back). What the downstream driver calls an
++ * S1-bypass domain works: a context bank of our own with translation
++ * disabled, which is an identity mapping. Used by the usb and mdp drivers.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int sweet_smmu_identity(const char *tag, uint64_t pa, uint32_t sid);
++
++#define SMMU_SCR0           0x000
++#define   SCR0_CLIENTPD     (1u << 0)
++#define   SCR0_USFCFG       (1u << 10)
++#define SMMU_IDR0           0x020
++#define   IDR0_NUMSMRG(v)   ((v) & 0xffu)
++#define   IDR0_EXIDS        (1u << 8)
++#define   IDR0_SMS          (1u << 27)  /* stream matching (bit 31 is the secure extension) */
++#define SMMU_IDR1           0x024
++#define   IDR1_NUMCB(v)     ((v) & 0xffu)
++#define   IDR1_NUMS2CB(v)   (((v) >> 16) & 0xffu)
++#define   IDR1_NUMPAGENDXB(v) (((v) >> 28) & 7u)
++#define   IDR1_PAGESIZE_64K (1u << 31)
++#define SMMU_TLBIALLNSNH    0x068
++#define SMMU_STLBGSYNC      0x070
++#define SMMU_STLBGSTATUS    0x074
++#define SMMU_SMR(n)         (0x800u + 4u * (n))
++#define   SMR_VALID         (1u << 31)
++#define SMMU_S2CR(n)        (0xc00u + 4u * (n))
++#define   S2CR_TYPE_MASK    (3u << 16)
++#define   S2CR_CBNDX_MASK   0xffu
++#define   S2CR_EXIDVALID    (1u << 10)
++#define SMMU_GR1_CBAR(n)    (4u * (n))
++#define   CBAR_S1_TRANS_S2_BYPASS (1u << 16)
++#define   CBAR_S1_BPSHCFG_NSH     (3u << 8)
++#define   CBAR_S1_MEMATTR_WB      (0xfu << 12)
++#define SMMU_GR1_CBA2R(n)   (0x800u + 4u * (n))
++#define   CBA2R_VA64        (1u << 0)
++#define SMMU_CB_SCTLR       0x000
++#define   SCTLR_CFRE        (1u << 5)
++#define   SCTLR_CFIE        (1u << 6)
++#define   SCTLR_CFCFG       (1u << 7)
++
++static uint32_t
++smmu_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++smmu_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* 0 when the stream now goes through an identity context, else -1 (logged) */
++int
++sweet_smmu_identity(const char *tag, uint64_t pa, uint32_t sid)
++{
++	vm_offset_t smmu = ml_io_map((vm_offset_t)pa, 0x100000);
++	if (smmu == 0) {
++		return -1;
++	}
++	uint32_t scr0 = smmu_rd(smmu, SMMU_SCR0), idr0 = smmu_rd(smmu, SMMU_IDR0), idr1 = smmu_rd(smmu, SMMU_IDR1);
++	unsigned nsmr = IDR0_NUMSMRG(idr0), numcb = IDR1_NUMCB(idr1), nums2cb = IDR1_NUMS2CB(idr1);
++	bool exids = (idr0 & IDR0_EXIDS) != 0;
++	uint32_t pagesize = (idr1 & IDR1_PAGESIZE_64K) ? 0x10000u : 0x1000u;
++	uint32_t size = (1u << (IDR1_NUMPAGENDXB(idr1) + 1)) * pagesize;
++	vm_offset_t gr1 = smmu + pagesize, cb_base = smmu + size / 2;
++	printf("%s: SMMU sCR0 0x%08x IDR0 0x%08x IDR1 0x%08x: %u stream match groups, %u context banks (%u stage 2), page %#x, size %#x%s%s\n",
++	    tag, scr0, idr0, idr1, nsmr, numcb, nums2cb, pagesize, size,
++	    (scr0 & SCR0_CLIENTPD) ? ", client port disabled (global bypass)" : "",
++	    (scr0 & SCR0_USFCFG) ? ", unmatched streams fault" : ", unmatched streams bypass");
++	if ((scr0 & SCR0_CLIENTPD) || !(idr0 & IDR0_SMS) || nsmr == 0 || numcb == 0 || size > 0x100000u) {
++		return -1;
++	}
++	/* the stream's match group: the one ABL set up, else a spare one */
++	int group = -1, spare = -1;
++	for (unsigned i = 0; i < nsmr; i++) {
++		uint32_t smr = smmu_rd(smmu, SMMU_SMR(i)), s2cr = smmu_rd(smmu, SMMU_S2CR(i));
++		bool valid = exids ? (s2cr & S2CR_EXIDVALID) != 0 : (smr & SMR_VALID) != 0;
++		uint32_t id = exids ? (smr & 0xffffu) : (smr & 0x7fffu);
++		uint32_t mask = exids ? (smr >> 16) : ((smr >> 16) & 0x7fffu);
++		if (!valid) {
++			if (spare < 0) {
++				spare = (int)i;
++			}
++			continue;
++		}
++		if ((id & ~mask) == (sid & ~mask)) {
++			printf("%s: SMMU stream 0x%x matched by group %u: SMR 0x%08x S2CR 0x%08x\n",
++			    tag, sid, i, smr, s2cr);
++			group = (int)i;
++			break;
++		}
++	}
++	if (group < 0 && spare < 0) {
++		printf("%s: SMMU has no spare stream match group for stream 0x%x\n", tag, sid);
++		return -1;
++	}
++	/* a stage 1 context bank no valid group refers to, from the top */
++	int cb = -1;
++	for (int n = (int)numcb - 1; n >= (int)nums2cb && cb < 0; n--) {
++		bool used = false;
++		for (unsigned i = 0; i < nsmr && !used; i++) {
++			uint32_t smr = smmu_rd(smmu, SMMU_SMR(i)), s2cr = smmu_rd(smmu, SMMU_S2CR(i));
++			bool valid = exids ? (s2cr & S2CR_EXIDVALID) != 0 : (smr & SMR_VALID) != 0;
++			used = valid && (s2cr & S2CR_TYPE_MASK) == 0 && (s2cr & S2CR_CBNDX_MASK) == (uint32_t)n;
++		}
++		if (!used) {
++			cb = n;
++		}
++	}
++	if (cb < 0) {
++		printf("%s: SMMU has no free context bank\n", tag);
++		return -1;
++	}
++	/* stage 1 bank with translation off = identity, stage 2 bypassed */
++	smmu_wr(gr1, SMMU_GR1_CBA2R((unsigned)cb), CBA2R_VA64);
++	smmu_wr(gr1, SMMU_GR1_CBAR((unsigned)cb), CBAR_S1_TRANS_S2_BYPASS | CBAR_S1_BPSHCFG_NSH | CBAR_S1_MEMATTR_WB);
++	smmu_wr(cb_base + (unsigned)cb * pagesize, SMMU_CB_SCTLR, SCTLR_CFCFG | SCTLR_CFIE | SCTLR_CFRE);
++	if (group >= 0) {
++		uint32_t s2cr = smmu_rd(smmu, SMMU_S2CR(group));
++		smmu_wr(smmu, SMMU_S2CR(group), (s2cr & ~(S2CR_TYPE_MASK | S2CR_CBNDX_MASK)) | (uint32_t)cb);
++	} else {
++		group = spare;
++		if (exids) {
++			smmu_wr(smmu, SMMU_SMR(group), sid);
++			smmu_wr(smmu, SMMU_S2CR(group), S2CR_EXIDVALID | (uint32_t)cb);
++		} else {
++			smmu_wr(smmu, SMMU_S2CR(group), (uint32_t)cb);
++			smmu_wr(smmu, SMMU_SMR(group), SMR_VALID | sid);
++		}
++	}
++	smmu_wr(smmu, SMMU_TLBIALLNSNH, 0);
++	smmu_wr(smmu, SMMU_STLBGSYNC, 0);
++	for (unsigned i = 0; i < 10000 && (smmu_rd(smmu, SMMU_STLBGSTATUS) & 1u); i++) {
++		delay(1);
++	}
++	printf("%s: SMMU group %d -> context bank %d: SMR 0x%08x S2CR 0x%08x CBAR 0x%08x SCTLR 0x%08x (identity)\n",
++	    tag, group, cb, smmu_rd(smmu, SMMU_SMR(group)), smmu_rd(smmu, SMMU_S2CR(group)),
++	    smmu_rd(gr1, SMMU_GR1_CBAR((unsigned)cb)), smmu_rd(cb_base + (unsigned)cb * pagesize, SMMU_CB_SCTLR));
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 75f662f..b243bea 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -39,6 +39,7 @@
+ #include <sys/kern_event.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_smmu_identity(const char *tag, uint64_t pa, uint32_t sid);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -197,143 +198,13 @@ hsphy_rmw(vm_offset_t phy, uint32_t off, uint32_t mask, uint32_t val)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
+-/*
+- * SMMUv2 (Linux arm-smmu.c, arm-smmu-regs.h). ABL leaves USB's stream matched
+- * to its own translation context; a DMA to our memory through those stale
+- * tables stalls the bus and resets the SoC. S2CR bypass is not available:
+- * TrustZone turns a non-secure bypass request into a fault (type 2 reads
+- * back). What the downstream driver calls an S1-bypass domain works: a
+- * context bank of our own with translation disabled, which is an identity
+- * mapping.
+- */
+-#define SMMU_SCR0           0x000
+-#define   SCR0_CLIENTPD     (1u << 0)
+-#define   SCR0_USFCFG       (1u << 10)
+-#define SMMU_IDR0           0x020
+-#define   IDR0_NUMSMRG(v)   ((v) & 0xffu)
+-#define   IDR0_EXIDS        (1u << 8)
+-#define   IDR0_SMS          (1u << 27)  /* stream matching (bit 31 is the secure extension) */
+-#define SMMU_IDR1           0x024
+-#define   IDR1_NUMCB(v)     ((v) & 0xffu)
+-#define   IDR1_NUMS2CB(v)   (((v) >> 16) & 0xffu)
+-#define   IDR1_NUMPAGENDXB(v) (((v) >> 28) & 7u)
+-#define   IDR1_PAGESIZE_64K (1u << 31)
+-#define SMMU_TLBIALLNSNH    0x068
+-#define SMMU_STLBGSYNC      0x070
+-#define SMMU_STLBGSTATUS    0x074
+-#define SMMU_SMR(n)         (0x800u + 4u * (n))
+-#define   SMR_VALID         (1u << 31)
+-#define SMMU_S2CR(n)        (0xc00u + 4u * (n))
+-#define   S2CR_TYPE_MASK    (3u << 16)
+-#define   S2CR_CBNDX_MASK   0xffu
+-#define   S2CR_EXIDVALID    (1u << 10)
+-#define SMMU_GR1_CBAR(n)    (4u * (n))
+-#define   CBAR_S1_TRANS_S2_BYPASS (1u << 16)
+-#define   CBAR_S1_BPSHCFG_NSH     (3u << 8)
+-#define   CBAR_S1_MEMATTR_WB      (0xfu << 12)
+-#define SMMU_GR1_CBA2R(n)   (0x800u + 4u * (n))
+-#define   CBA2R_VA64        (1u << 0)
+-#define SMMU_CB_SCTLR       0x000
+-#define   SCTLR_CFRE        (1u << 5)
+-#define   SCTLR_CFIE        (1u << 6)
+-#define   SCTLR_CFCFG       (1u << 7)
+-
+-static void
+-smmu_wr(vm_offset_t base, uint32_t off, uint32_t val)
+-{
+-	*(volatile uint32_t *)(base + off) = val;
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-}
+-
++/* the stream goes through an identity context bank before the first dma (sweet_smmu.c) */
+ static void
+ usb_smmu_bypass(void)
+ {
+-	if (usb_smmu_pa == 0) {
+-		return;
+-	}
+-	vm_offset_t smmu = ml_io_map((vm_offset_t)usb_smmu_pa, 0x100000);
+-	if (smmu == 0) {
+-		return;
+-	}
+-	uint32_t scr0 = usb_rd(smmu, SMMU_SCR0), idr0 = usb_rd(smmu, SMMU_IDR0), idr1 = usb_rd(smmu, SMMU_IDR1);
+-	unsigned nsmr = IDR0_NUMSMRG(idr0), numcb = IDR1_NUMCB(idr1), nums2cb = IDR1_NUMS2CB(idr1);
+-	bool exids = (idr0 & IDR0_EXIDS) != 0;
+-	uint32_t pagesize = (idr1 & IDR1_PAGESIZE_64K) ? 0x10000u : 0x1000u;
+-	uint32_t size = (1u << (IDR1_NUMPAGENDXB(idr1) + 1)) * pagesize;
+-	vm_offset_t gr1 = smmu + pagesize, cb_base = smmu + size / 2;
+-	printf("SWEET USB: SMMU sCR0 0x%08x IDR0 0x%08x IDR1 0x%08x: %u stream match groups, %u context banks (%u stage 2), page %#x, size %#x%s%s\n",
+-	    scr0, idr0, idr1, nsmr, numcb, nums2cb, pagesize, size,
+-	    (scr0 & SCR0_CLIENTPD) ? ", client port disabled (global bypass)" : "",
+-	    (scr0 & SCR0_USFCFG) ? ", unmatched streams fault" : ", unmatched streams bypass");
+-	if ((scr0 & SCR0_CLIENTPD) || !(idr0 & IDR0_SMS) || nsmr == 0 || numcb == 0 || size > 0x100000u) {
+-		return;
+-	}
+-	/* the stream's match group: the one ABL set up, else a spare one */
+-	int group = -1, spare = -1;
+-	for (unsigned i = 0; i < nsmr; i++) {
+-		uint32_t smr = usb_rd(smmu, SMMU_SMR(i)), s2cr = usb_rd(smmu, SMMU_S2CR(i));
+-		bool valid = exids ? (s2cr & S2CR_EXIDVALID) != 0 : (smr & SMR_VALID) != 0;
+-		uint32_t id = exids ? (smr & 0xffffu) : (smr & 0x7fffu);
+-		uint32_t mask = exids ? (smr >> 16) : ((smr >> 16) & 0x7fffu);
+-		if (!valid) {
+-			if (spare < 0) {
+-				spare = (int)i;
+-			}
+-			continue;
+-		}
+-		if ((id & ~mask) == (usb_smmu_sid & ~mask)) {
+-			printf("SWEET USB: SMMU stream 0x%x matched by group %u: SMR 0x%08x S2CR 0x%08x\n",
+-			    usb_smmu_sid, i, smr, s2cr);
+-			group = (int)i;
+-			break;
+-		}
+-	}
+-	if (group < 0 && spare < 0) {
+-		printf("SWEET USB: SMMU has no spare stream match group for stream 0x%x\n", usb_smmu_sid);
+-		return;
+-	}
+-	/* a stage 1 context bank no valid group refers to, from the top */
+-	int cb = -1;
+-	for (int n = (int)numcb - 1; n >= (int)nums2cb && cb < 0; n--) {
+-		bool used = false;
+-		for (unsigned i = 0; i < nsmr && !used; i++) {
+-			uint32_t smr = usb_rd(smmu, SMMU_SMR(i)), s2cr = usb_rd(smmu, SMMU_S2CR(i));
+-			bool valid = exids ? (s2cr & S2CR_EXIDVALID) != 0 : (smr & SMR_VALID) != 0;
+-			used = valid && (s2cr & S2CR_TYPE_MASK) == 0 && (s2cr & S2CR_CBNDX_MASK) == (uint32_t)n;
+-		}
+-		if (!used) {
+-			cb = n;
+-		}
+-	}
+-	if (cb < 0) {
+-		printf("SWEET USB: SMMU has no free context bank\n");
+-		return;
+-	}
+-	/* stage 1 bank with translation off = identity, stage 2 bypassed */
+-	smmu_wr(gr1, SMMU_GR1_CBA2R((unsigned)cb), CBA2R_VA64);
+-	smmu_wr(gr1, SMMU_GR1_CBAR((unsigned)cb), CBAR_S1_TRANS_S2_BYPASS | CBAR_S1_BPSHCFG_NSH | CBAR_S1_MEMATTR_WB);
+-	smmu_wr(cb_base + (unsigned)cb * pagesize, SMMU_CB_SCTLR, SCTLR_CFCFG | SCTLR_CFIE | SCTLR_CFRE);
+-	if (group >= 0) {
+-		uint32_t s2cr = usb_rd(smmu, SMMU_S2CR(group));
+-		smmu_wr(smmu, SMMU_S2CR(group), (s2cr & ~(S2CR_TYPE_MASK | S2CR_CBNDX_MASK)) | (uint32_t)cb);
+-	} else {
+-		group = spare;
+-		if (exids) {
+-			smmu_wr(smmu, SMMU_SMR(group), usb_smmu_sid);
+-			smmu_wr(smmu, SMMU_S2CR(group), S2CR_EXIDVALID | (uint32_t)cb);
+-		} else {
+-			smmu_wr(smmu, SMMU_S2CR(group), (uint32_t)cb);
+-			smmu_wr(smmu, SMMU_SMR(group), SMR_VALID | usb_smmu_sid);
+-		}
+-	}
+-	smmu_wr(smmu, SMMU_TLBIALLNSNH, 0);
+-	smmu_wr(smmu, SMMU_STLBGSYNC, 0);
+-	for (unsigned i = 0; i < 10000 && (usb_rd(smmu, SMMU_STLBGSTATUS) & 1u); i++) {
+-		delay(1);
++	if (usb_smmu_pa != 0) {
++		sweet_smmu_identity("SWEET USB", usb_smmu_pa, usb_smmu_sid);
+ 	}
+-	printf("SWEET USB: SMMU group %d -> context bank %d: SMR 0x%08x S2CR 0x%08x CBAR 0x%08x SCTLR 0x%08x (identity)\n",
+-	    group, cb, usb_rd(smmu, SMMU_SMR(group)), usb_rd(smmu, SMMU_S2CR(group)),
+-	    usb_rd(gr1, SMMU_GR1_CBAR((unsigned)cb)), usb_rd(cb_base + (unsigned)cb * pagesize, SMMU_CB_SCTLR));
+ }
+ 
+ /* phy-msm-ssusb-qmp.c: indexes into ssphy-reg, and the bits it writes */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 293e729..46f0e0b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -33,10 +33,24 @@
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+  * the first swap on (it still reaches the persistent log; panics draw).
++ *
++ * With an ADT /sweet-mdp node (pdx203) the display processor does the
++ * presenting (bsd/dev/sweet_mdp.c): a one-layer full-size swap points the
++ * panel's pipe at the client's surface itself and the pipe's scaler fits
++ * the logical size to the panel, other swaps are composed by the cpu into
++ * a logical-size buffer of the driver's own that the pipe shows instead.
++ * Boot-args: sweetfb_mdp=0 keeps the cpu copy into the splash buffer,
++ * sweetfb_fit=1 stretches to the panel instead of fitting the width.
+  */
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" {
++/* bsd/dev/sweet_mdp.c */
++bool sweet_mdp_init(uint64_t fb_phys, uint32_t fb_w, uint32_t fb_h, uint32_t src_w, uint32_t src_h, int fit);
++void sweet_mdp_show(uint64_t phys, uint32_t stride);
++void sweet_mdp_clean(const void *va, size_t len);
++}
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -117,12 +131,17 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	bool          fMDP;           /* the panel pipe shows a logical-size buffer */
++	IOBufferMemoryDescriptor *fComposite;   /* that buffer for cpu composed frames (fPhys, fPixels) */
++	SweetSurface *fShown;         /* client surface the pipe fetches, retained */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	bool showDirect(const uint8_t *rec);
++	void showComposite();
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -175,6 +194,32 @@ AppleCLCD::start(IOService *provider)
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
++	int mdp = 1, fit = 0;
++	PE_parse_boot_argn("sweetfb_mdp", &mdp, sizeof(mdp));
++	PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit));
++	if (!native && mdp != 0 && sweet_mdp_init(fPhys, fWidth, fHeight, fLogicalW, fLogicalH, fit)) {
++		/* the pipe scales a logical-size buffer, so the driver's own target is
++		 * one too (the splash buffer stays with the text console) */
++		uint32_t rowBytes = fLogicalW * 4;
++		vm_size_t size = (vm_size_t)rowBytes * fLogicalH;
++		IOByteCount len = 0;
++		fComposite = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, page_size);
++		addr64_t phys = fComposite != NULL ? fComposite->getPhysicalSegment(0, &len, kIOMemoryMapperNone) : 0;
++		if (phys != 0 && len >= size) {
++			bzero(fComposite->getBytesNoCopy(), size);
++			sweet_mdp_clean(fComposite->getBytesNoCopy(), size);
++			fPhys = phys;
++			fWidth = fLogicalW;
++			fHeight = fLogicalH;
++			fRowBytes = rowBytes;
++			fMDP = true;
++			sweet_surface_contig_min = (uint32_t)size;
++		} else {
++			OSSafeReleaseNULL(fComposite);
++			IOLog("SWEET FB: no contiguous buffer for the mdp, cpu present\n");
++		}
++	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+@@ -202,8 +247,8 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fMDP ? " by the mdp" : "");
+ 	return true;
+ }
+ 
+@@ -232,6 +277,16 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fFadeStep = step + 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
++		if (step == 0 && fb->fMDP && fb->fShown != NULL) {
++			/* the pipe shows a client surface, fade a copy of it instead */
++			SweetSurface *s = fb->fShown;
++			uintptr_t src = s->kernelAddress() + s->offset;
++			for (uint32_t y = 0; y < fb->fHeight; y++) {
++				memcpy((void *)(fb->fPixels + (uint64_t)y * fb->fRowBytes),
++				    (const void *)(src + (uint64_t)y * s->bytesPerRow), (size_t)fb->fWidth * 4);
++			}
++			fb->showComposite();
++		}
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+@@ -324,6 +379,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 			sweet_console_muted = 1;
+ 		}
+ 	}
++	if (fMDP && showDirect(rec)) {
++		return;
++	}
+ 
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+@@ -400,6 +458,81 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	if (fMDP) {
++		showComposite();
++	}
++}
++
++static uint32_t sweet_fb_direct_logged;
++
++/*
++ * The usual frame is one full-size layer: the pipe fetches that surface
++ * itself (physically contiguous, cleaned out of the cpu caches here) and
++ * keeps reading it until the next frame, so it stays retained. Anything
++ * else goes through the cpu path into the driver's buffer.
++ */
++bool
++AppleCLCD::showDirect(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104);
++	int layer = -1;
++
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		if ((mask & (1u << i)) && get32(rec, 0x54 + 4 * i) != 0) {
++			if (layer >= 0) {
++				return false;
++			}
++			layer = (int)i;
++		}
++	}
++	if (layer < 0) {
++		return false;
++	}
++	const uint8_t *a = rec + 0x64 + 16 * layer;
++	const uint8_t *b = rec + 0xc4 + 16 * layer;
++	uint32_t w = get32(b, 8), h = get32(b, 12);
++	if (get32(a, 0) != 0 || get32(a, 4) != 0 || get32(b, 0) != 0 || get32(b, 4) != 0 ||
++	    (w != 0 && w != fWidth) || (h != 0 && h != fHeight)) {
++		return false;
++	}
++	SweetSurface *s = sweet_surface_copy(get32(rec, 0x54 + 4 * layer));
++	if (s == NULL) {
++		return false;
++	}
++	if (s == fSurface) {
++		s->release();
++		showComposite();
++		return true;
++	}
++	uint64_t phys = s->physicalAddress();
++	uintptr_t va = s->kernelAddress();
++	uint64_t bytes = (uint64_t)s->bytesPerRow * s->height;
++	if (phys == 0 || va == 0 || s->width != fWidth || s->height != fHeight ||
++	    s->pixelFormat != SWEET_FB_FORMAT_BGRA || s->bytesPerElement != 4 ||
++	    s->elementWidth != 1 || s->elementHeight != 1 || s->planeCount > 1 ||
++	    (uint64_t)s->offset + bytes > s->allocSize) {
++		s->release();
++		return false;
++	}
++	sweet_mdp_clean((const void *)(va + s->offset), (size_t)bytes);
++	sweet_mdp_show(phys + s->offset, s->bytesPerRow);
++	if (sweet_fb_direct_logged < 4) {
++		sweet_fb_direct_logged++;
++		IOLog("SWEET FB: mdp shows surface %u at 0x%llx stride %u\n", s->id, phys + s->offset, s->bytesPerRow);
++	}
++	SweetSurface *old = fShown;
++	fShown = s;
++	OSSafeReleaseNULL(old);
++	return true;
++}
++
++/* the driver's own buffer is written through its write-combined mapping, no cache clean */
++void
++AppleCLCD::showComposite()
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	sweet_mdp_show(fPhys, fRowBytes);
++	OSSafeReleaseNULL(fShown);
+ }
+ 
+ bool
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..94a82e1 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -73,6 +73,7 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
++uint32_t             sweet_surface_contig_min;
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+@@ -104,6 +105,17 @@ SweetSurface::kernelAddress()
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+ }
+ 
++uint64_t
++SweetSurface::physicalAddress()
++{
++	IOByteCount len = 0;
++	if (memory == NULL) {
++		return 0;
++	}
++	addr64_t phys = memory->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
++	return (phys != 0 && len >= allocSize) ? phys : 0;
++}
++
+ static uint32_t *
+ sweet_surface_seed(SweetSurface *s)
+ {
+@@ -688,8 +700,14 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			IOOptionBits opts = kIODirectionInOut | kIOMemoryKernelUserShared;
++			if (sweet_surface_contig_min != 0 && s->allocSize >= sweet_surface_contig_min) {
++				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++				    opts | kIOMemoryPhysicallyContiguous, s->allocSize, page_size);
++			}
++			if (mem == NULL) {
++				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, opts, s->allocSize, page_size);
++			}
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..c60409e 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -45,8 +45,14 @@ public:
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+ 	uintptr_t kernelAddress();
++	/* physical address of the pixels when they are one contiguous range, else 0 */
++	uint64_t physicalAddress();
+ };
+ 
++/* buffer surfaces at least this big get physically contiguous memory (0 =
++ * none): the framebuffer shows display-sized ones through the panel pipe */
++extern uint32_t sweet_surface_contig_min;
++
+ /* Retained surface for an id, or NULL. */
+ SweetSurface *sweet_surface_copy(uint32_t id);
+ 

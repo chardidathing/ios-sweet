@@ -51,4 +51,7 @@ USB = dict(
     cbcr_cfg_noc=0x0502c, cbcr_aggre=0x8201c, cbcr_ahb2phy=0x6a004, cbcr_clkref=0x8c010,
     dwc3=0x0a600000, qscratch=0x0a6f8800, qusb2=0x088e2000)
 
+# video mode panel, the cpu present into the splash buffer stays
+MDP = None
+
 ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic

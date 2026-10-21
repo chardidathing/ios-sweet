@@ -183,7 +183,8 @@ def build(board, seed=None, qemu=False, highmem=False):
         ('reg', u64(b.UFS, b.UFS_SIZE)),
     ])
 
-    # Board driver wiring (bsd/dev/sweet_keys.c, sweet_touch.c, sweet_usb.c):
+    # Board driver wiring (bsd/dev/sweet_keys.c, sweet_touch.c, sweet_usb.c,
+    # sweet_mdp.c):
     # the drivers stay off without their node. Dict keys become property
     # names ('_' -> '-'); ints are u32, 64-bit addresses u64, lists of ints
     # u32 arrays, strings cstrings, and the rails list splits into the
@@ -211,6 +212,8 @@ def build(board, seed=None, qemu=False, highmem=False):
         board_nodes.append(board_node('sweet-touch', b.TOUCH, wide=('se', 'tlmm')))
     if b.USB:
         board_nodes.append(board_node('sweet-usb', b.USB, wide=('dwc3', 'qscratch', 'qusb2', 'hsphy', 'eud', 'ssphy', 'smmu')))
+    if b.MDP:
+        board_nodes.append(board_node('sweet-mdp', b.MDP, wide=('base', 'smmu')))
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.

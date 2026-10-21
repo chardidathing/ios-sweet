@@ -115,4 +115,15 @@ USB = dict(
                0x08, 0x04, 0x1c, 0x00, 0x10, 0x0c, 0x1c8c],
     ssphy_seq=USB_SSPHY_SEQ)
 
+# The display processor (mdss_mdp@ae00000, offsets from the sde catalog in
+# the stock dtb): mdp top, ctl_0, lm_0, the qseed3lite scaler inside a vig
+# pipe, vig_0's clock bit in mdp top, the eight source pipes (four vig then
+# four dma, so the splash pipe ABL staged can be found) and the mdp's
+# unsecure stream behind the apps SMMU. The kernel presents through it
+# (bsd/dev/sweet_mdp.c), boot-arg sweetfb_mdp=0 goes back to the cpu copy.
+MDP = dict(base=0x0ae00000, top=0x1000, ctl=0x2000, lm=0x45000, qseed=0xa00,
+           clk_ctrl=0x2ac, clk_bit=0,
+           sspp=[0x5000, 0x7000, 0x9000, 0xb000, 0x25000, 0x27000, 0x29000, 0x2b000],
+           smmu=0x15000000, smmu_sid=0x820)
+
 ECID = 0x5044583230330001  # 'PDX203' + 1, synthetic
