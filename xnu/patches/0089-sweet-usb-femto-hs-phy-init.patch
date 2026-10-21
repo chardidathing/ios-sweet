@@ -1,0 +1,136 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 83956d3..86b227d 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -71,6 +71,11 @@ static const struct {
+ static uint32_t usb_cbcr_off[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ static uint32_t usb_gdscr;
+ static uint64_t usb_dwc3_pa, usb_qscratch_pa, usb_qusb2_pa;
++/* SNPS femto HS PHY (kona): hsphy register base, its GCC BCR, the EUD enable
++ * register that means the debugger owns the PHY, and the DT parameter
++ * override sequence (value, offset pairs). */
++static uint64_t usb_hsphy_pa, usb_eud_pa;
++static uint32_t usb_hsphy_reset, usb_hsphy_override[8], usb_hsphy_noverride;
+ 
+ #define DWC3_SIZE               0x0000d000
+ #define QUSB2_SIZE              0x00000400
+@@ -103,9 +108,111 @@ usb_config(DTEntry node)
+ 	if (SecureDTGetProperty(node, "qusb2", &prop, &size) == kSuccess && size == 8) {
+ 		memcpy(&usb_qusb2_pa, prop, 8);
+ 	}
++	usb_hsphy_pa = usb_eud_pa = 0;
++	usb_hsphy_noverride = 0;
++	if (SecureDTGetProperty(node, "hsphy", &prop, &size) == kSuccess && size == 8) {
++		memcpy(&usb_hsphy_pa, prop, 8);
++		if (SecureDTGetProperty(node, "eud", &prop, &size) == kSuccess && size == 8) {
++			memcpy(&usb_eud_pa, prop, 8);
++		}
++		if (SecureDTGetProperty(node, "hsphy-reset", (void const **)&val, &size) != kSuccess || size != 4) {
++			return false;
++		}
++		usb_hsphy_reset = *val;
++		if (SecureDTGetProperty(node, "hsphy-override", (void const **)&val, &size) == kSuccess &&
++		    size <= sizeof(usb_hsphy_override) && (size & 7u) == 0) {
++			memcpy(usb_hsphy_override, val, size);
++			usb_hsphy_noverride = size / 4;
++		}
++	}
+ 	return usb_cbcr_off[0] != 0 && usb_cbcr_off[3] != 0;
+ }
+ 
++/* Linux phy-msm-snps-hs.c register map */
++#define HSPHY_UTMI_CTRL0        0x3c
++#define   HSPHY_SLEEPM          (1u << 0)
++#define HSPHY_UTMI_CTRL5        0x50
++#define   HSPHY_POR             (1u << 1)
++#define HSPHY_CTRL_COMMON0      0x54
++#define   HSPHY_FSEL_MASK       (7u << 4)
++#define HSPHY_CTRL_COMMON1      0x58
++#define   HSPHY_VBUSVLDEXTSEL0  (1u << 4)
++#define   HSPHY_PLLBTUNE        (1u << 5)
++#define HSPHY_CTRL_COMMON2      0x5c
++#define   HSPHY_VREGBYPASS      (1u << 0)
++#define HSPHY_CTRL1             0x60
++#define   HSPHY_VBUSVLDEXT0     (1u << 0)
++#define HSPHY_CTRL2             0x64
++#define   HSPHY_SUSPEND_N       (1u << 2)
++#define   HSPHY_SUSPEND_N_SEL   (1u << 3)
++#define HSPHY_CFG0              0x94
++#define   HSPHY_CMN_CTRL_OVERRIDE_EN (1u << 1)
++#define HSPHY_REFCLK_CTRL       0xa0
++#define   HSPHY_REFCLK_SEL_MASK 3u
++#define   HSPHY_REFCLK_SEL_DEFAULT 2u
++
++static void
++hsphy_rmw(vm_offset_t phy, uint32_t off, uint32_t mask, uint32_t val)
++{
++	uint32_t v = (usb_rd(phy, off) & ~mask) | val;
++	*(volatile uint32_t *)(phy + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * The femto HS PHY as Linux msm_hsphy_init brings it up: BCR pulse, then the
++ * register sequence with the DT parameter overrides. ABL may leave the PHY
++ * powered down after a fastboot reboot; a re-init of a running PHY is what
++ * Linux does at every boot too. Skipped when the EUD owns the PHY.
++ */
++static void
++usb_hsphy_init(vm_offset_t gcc)
++{
++	if (usb_hsphy_pa == 0) {
++		return;
++	}
++	if (usb_eud_pa != 0) {
++		vm_offset_t eud = ml_io_map((vm_offset_t)usb_eud_pa, 0x10);
++		if (eud != 0 && usb_rd(eud, 0) != 0) {
++			printf("SWEET USB: EUD enabled (0x%08x); HS PHY left alone\n", usb_rd(eud, 0));
++			return;
++		}
++	}
++	vm_offset_t phy = ml_io_map((vm_offset_t)usb_hsphy_pa, 0x200);
++	if (phy == 0) {
++		return;
++	}
++	printf("SWEET USB: HS PHY before: CFG0 0x%02x UTMI_CTRL5 0x%02x COMMON0 0x%02x CTRL2 0x%02x REFCLK 0x%02x\n",
++	    usb_rd(phy, HSPHY_CFG0), usb_rd(phy, HSPHY_UTMI_CTRL5), usb_rd(phy, HSPHY_CTRL_COMMON0),
++	    usb_rd(phy, HSPHY_CTRL2), usb_rd(phy, HSPHY_REFCLK_CTRL));
++	*(volatile uint32_t *)(gcc + usb_hsphy_reset) = usb_rd(gcc, usb_hsphy_reset) | 1u;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(150);
++	*(volatile uint32_t *)(gcc + usb_hsphy_reset) = usb_rd(gcc, usb_hsphy_reset) & ~1u;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(150);
++	hsphy_rmw(phy, HSPHY_CFG0, HSPHY_CMN_CTRL_OVERRIDE_EN, HSPHY_CMN_CTRL_OVERRIDE_EN);
++	hsphy_rmw(phy, HSPHY_UTMI_CTRL5, HSPHY_POR, HSPHY_POR);
++	hsphy_rmw(phy, HSPHY_CTRL_COMMON0, HSPHY_FSEL_MASK, 0);
++	hsphy_rmw(phy, HSPHY_CTRL_COMMON1, HSPHY_PLLBTUNE, HSPHY_PLLBTUNE);
++	hsphy_rmw(phy, HSPHY_REFCLK_CTRL, HSPHY_REFCLK_SEL_MASK, HSPHY_REFCLK_SEL_DEFAULT);
++	hsphy_rmw(phy, HSPHY_CTRL_COMMON1, HSPHY_VBUSVLDEXTSEL0, HSPHY_VBUSVLDEXTSEL0);
++	hsphy_rmw(phy, HSPHY_CTRL1, HSPHY_VBUSVLDEXT0, HSPHY_VBUSVLDEXT0);
++	for (unsigned i = 0; i + 1 < usb_hsphy_noverride; i += 2) {
++		*(volatile uint32_t *)(phy + usb_hsphy_override[i + 1]) = usb_hsphy_override[i];
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	hsphy_rmw(phy, HSPHY_CTRL_COMMON2, HSPHY_VREGBYPASS, HSPHY_VREGBYPASS);
++	hsphy_rmw(phy, HSPHY_CTRL2, HSPHY_SUSPEND_N_SEL | HSPHY_SUSPEND_N, HSPHY_SUSPEND_N_SEL | HSPHY_SUSPEND_N);
++	hsphy_rmw(phy, HSPHY_UTMI_CTRL0, HSPHY_SLEEPM, HSPHY_SLEEPM);
++	hsphy_rmw(phy, HSPHY_UTMI_CTRL5, HSPHY_POR, 0);
++	hsphy_rmw(phy, HSPHY_CTRL2, HSPHY_SUSPEND_N_SEL, 0);
++	hsphy_rmw(phy, HSPHY_CFG0, HSPHY_CMN_CTRL_OVERRIDE_EN, 0);
++	printf("SWEET USB: HS PHY after: CFG0 0x%02x UTMI_CTRL5 0x%02x COMMON0 0x%02x CTRL2 0x%02x REFCLK 0x%02x\n",
++	    usb_rd(phy, HSPHY_CFG0), usb_rd(phy, HSPHY_UTMI_CTRL5), usb_rd(phy, HSPHY_CTRL_COMMON0),
++	    usb_rd(phy, HSPHY_CTRL2), usb_rd(phy, HSPHY_REFCLK_CTRL));
++}
++
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -188,6 +295,7 @@ sweet_usb_probe(void)
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
+ 	if (enabled >= 2) {
++		usb_hsphy_init(gcc);
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+ 	if (usb_qusb2_pa == 0) {
