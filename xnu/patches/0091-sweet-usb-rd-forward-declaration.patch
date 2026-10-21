@@ -1,0 +1,12 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 0ffffde..c38267b 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -69,6 +69,7 @@ static const struct {
+ 	{ "phy-pipe", "cbcr-pipe" },
+ };
+ static uint32_t usb_cbcr_off[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
++static uint32_t usb_rd(vm_offset_t base, uint32_t off);
+ static uint32_t usb_gdscr;
+ static uint64_t usb_dwc3_pa, usb_qscratch_pa, usb_qusb2_pa;
+ /* SNPS femto HS PHY (kona): hsphy register base, its GCC BCR, the EUD enable
