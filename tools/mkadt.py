@@ -184,13 +184,33 @@ def build(board, seed=None, qemu=False, highmem=False):
     ])
 
     # Board driver wiring (bsd/dev/sweet_keys.c, sweet_touch.c, sweet_usb.c):
-    # the drivers stay off without their node.
-    keys = node('sweet-keys', [ph()] + [(k.replace('_', '-'), u32(v)) for k, v in b.KEYS.items()])
-    board_nodes = [keys]
+    # the drivers stay off without their node. Dict keys become property
+    # names ('_' -> '-'); ints are u32, 64-bit addresses u64, lists of ints
+    # u32 arrays, strings cstrings, and the rails list splits into the
+    # name list plus 'rails-mv'.
+    def board_node(name, cfg, wide=()):
+        props = [ph()]
+        for k, v in cfg.items():
+            key = k.replace('_', '-')
+            if k == 'rails':
+                props.append((key, b''.join(cstr(n) for n, _ in v)))
+                props.append(('rails-mv', u32(*[mv for _, mv in v])))
+            elif isinstance(v, str):
+                props.append((key, cstr(v)))
+            elif isinstance(v, bool):
+                props.append((key, u32(int(v))))
+            elif isinstance(v, list):
+                props.append((key, u32(*v)))
+            elif k in wide:
+                props.append((key, u64(v)))
+            else:
+                props.append((key, u32(v)))
+        return node(name, props)
+    board_nodes = [board_node('sweet-keys', b.KEYS)]
     if b.TOUCH:
-        board_nodes.append(node('sweet-touch', [ph()]))
+        board_nodes.append(board_node('sweet-touch', b.TOUCH, wide=('se', 'tlmm')))
     if b.USB:
-        board_nodes.append(node('sweet-usb', [ph()]))
+        board_nodes.append(board_node('sweet-usb', b.USB, wide=('dwc3', 'qscratch', 'qusb2')))
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
