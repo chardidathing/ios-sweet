@@ -103,7 +103,7 @@ Needs `aarch64-linux-gnu-gcc` and `mkbootimg`.
 python3 tools/mkadt.py shim/out/sweet.adt --highmem
 python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/sweet.adt shim/out/payload.bin \
     --cmdline 'debug=0xc serial=3 cpus=6 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30'
-shim/build.sh ../shim/out/payload.bin      # -> shim/out/shim-boot.img
+shim/build.sh ../shim/out/payload.bin      # -> shim/out/sweet/shim-boot.img
 ```
 
 What the less obvious boot-args do:
@@ -123,7 +123,7 @@ What the less obvious boot-args do:
 ```sh
 fastboot -S 512M flash userdata ios16-root.simg   # ~7 minutes; do not unplug
 # Xiaomi's fastboot often hangs after a large flash: re-enter fastboot with Power + Volume down
-fastboot boot shim/out/shim-boot.img
+fastboot boot shim/out/sweet/shim-boot.img
 ```
 
 The first boot takes about 4–5 minutes on the Apple logo, then the lock screen appears. Swipe up to unlock. To get back to fastboot, hold Power + Volume down.
@@ -142,6 +142,10 @@ The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces 
 
 `tools/qemu-sweet.py` boots the same kernel on QEMU `virt` with a test RAM-disk root. It is useful for kernel-only changes; see `NOTES.md`.
 
+## Other phones
+
+The numbers that are specific to one phone live in one file per layer: `tools/boards/<board>.py` for the device tree generator (`mkadt.py --board`), `shim/boards/<board>.h` and `.sh` for the shim (`BOARD=<board> shim/build.sh`). The kernel is the same binary for every board: it takes the framebuffer from the shim's boot-args and the key wiring from the device tree. The Sony Xperia 1 II (`pdx203`, SM8250) port is documented in [`docs/PDX203.md`](docs/PDX203.md).
+
 ## Repository layout
 
 | Path | What |
@@ -149,7 +153,9 @@ The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces 
 | `shim/` | Bare-metal boot shim (C + asm) packed as an Android boot.img v2 |
 | `xnu/patches/` | The XNU patch series (applied in order by CI), plus staging scripts for libpthread, HFS and BearSSL |
 | `.github/workflows/xnu.yml` | Kernel CI build |
-| `tools/mkadt.py` | Generates the Apple Device Tree from sweet's MMIO layout and the iPhone X identity |
+| `tools/mkadt.py`, `tools/boards/` | Generates the Apple Device Tree from the board's MMIO layout and the iPhone X identity |
+| `shim/boards/` | Per-board shim constants and boot.img header |
+| `docs/PDX203.md` | The Xperia 1 II port: hardware facts, build, test plan |
 | `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
 | `tools/mkiosroot.sh` | Builds the HFS+ iOS root from the IPSW images |
 | `tools/sweet-root-tweaks.py` | Bring-up changes to the root (Setup skip, activation, daemons) |
@@ -186,6 +192,7 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 | 0066–0067 | Fault-region crash info; console mute |
 | 0068 | IOSurface lookup semantics for already-mapped surfaces |
 | 0069 | Batched persistent-log flushes |
+| 0082–0084 | Board-independent kernel: framebuffer from boot-args, key wiring and board drivers from the device tree, iPhone X size on any panel |
 
 ## Key hardware facts
 
