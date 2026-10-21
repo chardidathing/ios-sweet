@@ -1,0 +1,59 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index a0edbca..ecd380f 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -408,8 +408,16 @@ sweet_usb_probe(void)
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
+ 	if (enabled >= 2) {
+-		usb_hsphy_init(gcc);
+-		usb_ssphy_init(gcc);
++		/* bring-up knobs: sweetusbhs=0 / sweetusbss=0 skip a PHY init */
++		int hs = 1, ss = 1;
++		PE_parse_boot_argn("sweetusbhs", &hs, sizeof(hs));
++		PE_parse_boot_argn("sweetusbss", &ss, sizeof(ss));
++		if (hs) {
++			usb_hsphy_init(gcc);
++		}
++		if (ss) {
++			usb_ssphy_init(gcc);
++		}
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+ 	if (usb_qusb2_pa == 0) {
+@@ -1202,17 +1210,29 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	/* Events: disconnect, USB reset, connect done */
+ 	dwc_wr(DEVTEN, 0x7);
+ 
+-	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
+-	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
+-	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
+-	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+-	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
++	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done.
++	 * One line per step: a hung register access shows as the last line printed. */
++	printf("SWEET USB: ep0 start config\n");
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0)) {
++		printf("SWEET USB: endpoint 0 setup failed (start config)\n");
++		return;
++	}
++	printf("SWEET USB: ep0 set config\n");
++	if (ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
++	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("SWEET USB: endpoint 0 setup failed (ep0 config)\n");
++		return;
++	}
++	printf("SWEET USB: ep1 set config\n");
++	if (ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
+ 	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+-		printf("SWEET USB: endpoint 0 setup failed\n");
++		printf("SWEET USB: endpoint 0 setup failed (ep1 config)\n");
+ 		return;
+ 	}
+ 	dwc_wr(DALEPENA, 0x3);
++	printf("SWEET USB: ep0 enabled, queueing the first setup packet\n");
+ 	ud_start_setup();
++	printf("SWEET USB: setup packet queued\n");
+ 
+ 	vm_offset_t qs = ml_io_map((vm_offset_t)usb_qscratch_pa, 0x100);
+ 	if (qs != 0) {
