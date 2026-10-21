@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 128a9f3..0720f84 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -71,6 +71,7 @@ static const struct {
+ static uint32_t usb_cbcr_off[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ static uint32_t usb_rd(vm_offset_t base, uint32_t off);
+ static uint32_t usb_gdscr;
++static bool usb_hs_only;   /* no SuperSpeed PHY: pipe domain from the UTMI clock */
+ static uint64_t usb_dwc3_pa, usb_qscratch_pa, usb_qusb2_pa;
+ /* SNPS femto HS PHY (kona): hsphy register base, its GCC BCR, the EUD enable
+  * register that means the debugger owns the PHY, and the DT parameter
+@@ -420,7 +421,7 @@ sweet_usb_probe(void)
+ 		if (ss) {
+ 			usb_ssphy_init(gcc);
+ 		}
+-		ud.hs_only = !ss;
++		usb_hs_only = !ss;
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+ 	if (usb_qusb2_pa == 0) {
+@@ -551,7 +552,6 @@ static struct {
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
+-	bool hs_only;      /* no SuperSpeed PHY: pipe domain from the UTMI clock */
+ } ud;
+ 
+ static inline void
+@@ -1194,7 +1194,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 	vm_offset_t qs = ml_io_map((vm_offset_t)usb_qscratch_pa, 0x100);
+-	if (qs != 0 && ud.hs_only) {
++	if (qs != 0 && usb_hs_only) {
+ 		/*
+ 		 * High speed only, as dwc3-msm does after the controller reset when
+ 		 * there is no SuperSpeed PHY: the pipe clock domain runs from the
