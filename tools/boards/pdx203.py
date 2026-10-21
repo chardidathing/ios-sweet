@@ -56,6 +56,7 @@ TOUCH = dict(
 USB = dict(
     gdscr=0x0f004, cbcr_master=0x0f010, cbcr_sleep=0x0f018, cbcr_utmi=0x0f01c,
     cbcr_cfg_noc=0x0f07c, cbcr_aggre=0x0f080,
+    cbcr_aux=0x0f054, cbcr_com_aux=0x0f058, cbcr_pipe=0x0f05c,
     dwc3=0x0a600000, qscratch=0x0a6f8800)
 
 ECID = 0x5044583230330001  # 'PDX203' + 1, synthetic

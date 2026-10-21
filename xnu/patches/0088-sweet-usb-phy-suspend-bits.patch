@@ -1,0 +1,45 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index a95b326..83956d3 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -64,6 +64,9 @@ static const struct {
+ 	{ "aggre-axi", "cbcr-aggre" },
+ 	{ "ahb2phy", "cbcr-ahb2phy" },
+ 	{ "clkref", "cbcr-clkref" },
++	{ "phy-aux", "cbcr-aux" },
++	{ "phy-com-aux", "cbcr-com-aux" },
++	{ "phy-pipe", "cbcr-pipe" },
+ };
+ static uint32_t usb_cbcr_off[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ static uint32_t usb_gdscr;
+@@ -218,6 +221,11 @@ sweet_usb_probe(void)
+  * ep0.c).
+  */
+ #define GCTL            0xc110
++#define GUSB2PHYCFG     0xc200
++#define   GUSB2PHYCFG_SUSPHY    (1u << 6)
++#define   GUSB2PHYCFG_ENBLSLPM  (1u << 8)
++#define GUSB3PIPECTL    0xc2c0
++#define   GUSB3PIPECTL_SUSPHY   (1u << 17)
+ #define GEVNTADRLO      0xc400
+ #define GEVNTADRHI      0xc404
+ #define GEVNTSIZ        0xc408
+@@ -948,6 +956,18 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 
++	/*
++	 * Databook 6.3.2.5: endpoint commands do not complete while the PHYs may
++	 * sleep. Linux clears GUSB2PHYCFG SUSPHY/ENBLSLPM around every command
++	 * and GUSB3PIPECTL SUSPHY at init; kona's ABL leaves ENBLSLPM set, and
++	 * the first DEPCMD timed out with it.
++	 */
++	uint32_t phycfg = dwc_rd(GUSB2PHYCFG), pipectl = dwc_rd(GUSB3PIPECTL);
++	dwc_wr(GUSB2PHYCFG, phycfg & ~(GUSB2PHYCFG_SUSPHY | GUSB2PHYCFG_ENBLSLPM));
++	dwc_wr(GUSB3PIPECTL, pipectl & ~GUSB3PIPECTL_SUSPHY);
++	printf("SWEET USB: GUSB2PHYCFG 0x%08x -> 0x%08x GUSB3PIPECTL 0x%08x -> 0x%08x\n",
++	    phycfg, dwc_rd(GUSB2PHYCFG), pipectl, dwc_rd(GUSB3PIPECTL));
++
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+ 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
