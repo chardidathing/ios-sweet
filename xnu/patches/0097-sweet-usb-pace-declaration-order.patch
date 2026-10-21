@@ -1,0 +1,20 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index edea3b4..830bc7d 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -72,6 +72,7 @@ static uint32_t usb_cbcr_off[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ static uint32_t usb_rd(vm_offset_t base, uint32_t off);
+ static uint32_t usb_gdscr;
+ static bool usb_hs_only;   /* no SuperSpeed PHY: pipe domain from the UTMI clock */
++static unsigned usb_pace_ms = 2000; /* bring-up step pacing, see usb_pace */
+ static uint64_t usb_dwc3_pa, usb_qscratch_pa, usb_qusb2_pa;
+ /* SNPS femto HS PHY (kona): hsphy register base, its GCC BCR, the EUD enable
+  * register that means the debugger owns the PHY, and the DT parameter
+@@ -1170,7 +1171,6 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+  * hung bus resets the SoC within that second, so each start-up step waits
+  * for its line to reach the disk (boot-arg sweetusbpace, ms, default 2000).
+  */
+-static unsigned usb_pace_ms = 2000;
+ static int usb_pace_chan;
+ 
+ static void
