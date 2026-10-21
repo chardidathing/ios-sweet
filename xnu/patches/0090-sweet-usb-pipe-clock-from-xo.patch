@@ -1,0 +1,42 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 86b227d..0ffffde 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -75,6 +75,10 @@ static uint64_t usb_dwc3_pa, usb_qscratch_pa, usb_qusb2_pa;
+  * register that means the debugger owns the PHY, and the DT parameter
+  * override sequence (value, offset pairs). */
+ static uint64_t usb_hsphy_pa, usb_eud_pa;
++/* GCC mux feeding the USB3 pipe clock: with the SuperSpeed PHY down the
++ * pipe branch only runs from the XO leg (pipe-mux register, pipe-mux-xo
++ * selector), and the DWC3 core needs that clock for endpoint commands. */
++static uint32_t usb_pipe_mux, usb_pipe_mux_xo;
+ static uint32_t usb_hsphy_reset, usb_hsphy_override[8], usb_hsphy_noverride;
+ 
+ #define DWC3_SIZE               0x0000d000
+@@ -108,6 +112,13 @@ usb_config(DTEntry node)
+ 	if (SecureDTGetProperty(node, "qusb2", &prop, &size) == kSuccess && size == 8) {
+ 		memcpy(&usb_qusb2_pa, prop, 8);
+ 	}
++	usb_pipe_mux = usb_pipe_mux_xo = 0;
++	if (SecureDTGetProperty(node, "pipe-mux", (void const **)&val, &size) == kSuccess && size == 4) {
++		usb_pipe_mux = *val;
++		if (SecureDTGetProperty(node, "pipe-mux-xo", (void const **)&val, &size) == kSuccess && size == 4) {
++			usb_pipe_mux_xo = *val;
++		}
++	}
+ 	usb_hsphy_pa = usb_eud_pa = 0;
+ 	usb_hsphy_noverride = 0;
+ 	if (SecureDTGetProperty(node, "hsphy", &prop, &size) == kSuccess && size == 8) {
+@@ -262,6 +273,12 @@ sweet_usb_probe(void)
+ 	/* ABL leaves branches off after a fastboot reboot (kona: the UTMI clock,
+ 	 * without which endpoint commands never complete). Turn on every
+ 	 * described branch that is off, as the Linux clock driver would. */
++	if (usb_pipe_mux != 0) {
++		uint32_t mux = usb_rd(gcc, usb_pipe_mux);
++		*(volatile uint32_t *)(gcc + usb_pipe_mux) = (mux & ~3u) | (usb_pipe_mux_xo & 3u);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("SWEET USB: pipe clock mux 0x%08x -> 0x%08x (XO)\n", mux, usb_rd(gcc, usb_pipe_mux));
++	}
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+ 		if (usb_cbcr_off[i] == 0 || !(cbcr[i] & CBCR_CLK_OFF)) {
+ 			continue;

@@ -57,6 +57,9 @@ USB = dict(
     gdscr=0x0f004, cbcr_master=0x0f010, cbcr_sleep=0x0f018, cbcr_utmi=0x0f01c,
     cbcr_cfg_noc=0x0f07c, cbcr_aggre=0x0f080,
     cbcr_aux=0x0f054, cbcr_com_aux=0x0f058, cbcr_pipe=0x0f05c,
+    # gcc_usb3_prim_phy_pipe_clk_src: selector 2 = bi_tcxo, the only leg that
+    # runs while the SuperSpeed PHY is down
+    pipe_mux=0x0f060, pipe_mux_xo=2,
     dwc3=0x0a600000, qscratch=0x0a6f8800,
     # the femto HS PHY (hsphy@88e3000), its EUD enable register, its GCC BCR
     # (GCC_QUSB2PHY_PRIM_BCR) and the DT qcom,param-override-seq (value, offset)
