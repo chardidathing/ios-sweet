@@ -1,0 +1,79 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index ecd380f..128a9f3 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -408,8 +408,10 @@ sweet_usb_probe(void)
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
+ 	if (enabled >= 2) {
+-		/* bring-up knobs: sweetusbhs=0 / sweetusbss=0 skip a PHY init */
+-		int hs = 1, ss = 1;
++		/* sweetusbhs=0 skips the HS PHY init; sweetusbss=1 also brings up the
++		 * SuperSpeed PHY (default: high speed only, the core's pipe domain
++		 * runs from the UTMI clock, see sweet_usb_gadget_start) */
++		int hs = 1, ss = 0;
+ 		PE_parse_boot_argn("sweetusbhs", &hs, sizeof(hs));
+ 		PE_parse_boot_argn("sweetusbss", &ss, sizeof(ss));
+ 		if (hs) {
+@@ -418,6 +420,7 @@ sweet_usb_probe(void)
+ 		if (ss) {
+ 			usb_ssphy_init(gcc);
+ 		}
++		ud.hs_only = !ss;
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+ 	if (usb_qusb2_pa == 0) {
+@@ -476,6 +479,10 @@ sweet_usb_probe(void)
+  * session; Linux dwc3-qcom forces that in software when the charger
+  * reports a cable (dwc3_qcom_vbus_override_enable).
+  */
++#define QSCRATCH_GENERAL_CFG    0x08
++#define   PIPE_UTMI_CLK_SEL     (1u << 0)
++#define   PIPE3_PHYSTATUS_SW    (1u << 3)
++#define   PIPE_UTMI_CLK_DIS     (1u << 8)
+ #define QSCRATCH_HS_PHY_CTRL    0x10
+ #define   UTMI_OTG_VBUS_VALID   (1u << 20)
+ #define   SW_SESSVLD_SEL        (1u << 28)
+@@ -544,6 +551,7 @@ static struct {
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
++	bool hs_only;      /* no SuperSpeed PHY: pipe domain from the UTMI clock */
+ } ud;
+ 
+ static inline void
+@@ -1185,6 +1193,26 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+ 		return;
+ 	}
++	vm_offset_t qs = ml_io_map((vm_offset_t)usb_qscratch_pa, 0x100);
++	if (qs != 0 && ud.hs_only) {
++		/*
++		 * High speed only, as dwc3-msm does after the controller reset when
++		 * there is no SuperSpeed PHY: the pipe clock domain runs from the
++		 * UTMI clock and PHYSTATUS is forced, so endpoint commands complete
++		 * with the SS PHY (and its pipe clock) powered down.
++		 */
++		volatile uint32_t *cfg = (volatile uint32_t *)(qs + QSCRATCH_GENERAL_CFG);
++		uint32_t before = *cfg;
++		*cfg = before | PIPE_UTMI_CLK_DIS;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		delay(5);
++		*cfg = *cfg | PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		delay(5);
++		*cfg = *cfg & ~PIPE_UTMI_CLK_DIS;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("SWEET USB: high speed only: GENERAL_CFG 0x%08x -> 0x%08x\n", before, *cfg);
++	}
+ 
+ 	/*
+ 	 * Databook 6.3.2.5: endpoint commands do not complete while the PHYs may
+@@ -1234,7 +1262,6 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	ud_start_setup();
+ 	printf("SWEET USB: setup packet queued\n");
+ 
+-	vm_offset_t qs = ml_io_map((vm_offset_t)usb_qscratch_pa, 0x100);
+ 	if (qs != 0) {
+ 		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+ 		printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
