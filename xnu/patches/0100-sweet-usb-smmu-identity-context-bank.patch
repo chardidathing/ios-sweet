@@ -1,0 +1,182 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index fd0b95c..3e35150 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -198,10 +198,13 @@ hsphy_rmw(vm_offset_t phy, uint32_t off, uint32_t mask, uint32_t val)
+ }
+ 
+ /*
+- * SMMUv2 global register space 0 (Linux arm-smmu.c). ABL leaves USB's stream
+- * matched to its own translation context; a DMA to our memory through those
+- * stale tables stalls the bus and resets the SoC. Linux installs its own
+- * context, here the stream simply bypasses translation.
++ * SMMUv2 (Linux arm-smmu.c, arm-smmu-regs.h). ABL leaves USB's stream matched
++ * to its own translation context; a DMA to our memory through those stale
++ * tables stalls the bus and resets the SoC. S2CR bypass is not available:
++ * TrustZone turns a non-secure bypass request into a fault (type 2 reads
++ * back). What the downstream driver calls an S1-bypass domain works: a
++ * context bank of our own with translation disabled, which is an identity
++ * mapping.
+  */
+ #define SMMU_SCR0           0x000
+ #define   SCR0_CLIENTPD     (1u << 0)
+@@ -210,12 +213,37 @@ hsphy_rmw(vm_offset_t phy, uint32_t off, uint32_t mask, uint32_t val)
+ #define   IDR0_NUMSMRG(v)   ((v) & 0xffu)
+ #define   IDR0_EXIDS        (1u << 8)
+ #define   IDR0_SMS          (1u << 27)  /* stream matching (bit 31 is the secure extension) */
++#define SMMU_IDR1           0x024
++#define   IDR1_NUMCB(v)     ((v) & 0xffu)
++#define   IDR1_NUMS2CB(v)   (((v) >> 16) & 0xffu)
++#define   IDR1_NUMPAGENDXB(v) (((v) >> 28) & 7u)
++#define   IDR1_PAGESIZE_64K (1u << 31)
++#define SMMU_TLBIALLNSNH    0x068
++#define SMMU_STLBGSYNC      0x070
++#define SMMU_STLBGSTATUS    0x074
+ #define SMMU_SMR(n)         (0x800u + 4u * (n))
+ #define   SMR_VALID         (1u << 31)
+ #define SMMU_S2CR(n)        (0xc00u + 4u * (n))
+ #define   S2CR_TYPE_MASK    (3u << 16)
+-#define   S2CR_TYPE_BYPASS  (1u << 16)
++#define   S2CR_CBNDX_MASK   0xffu
+ #define   S2CR_EXIDVALID    (1u << 10)
++#define SMMU_GR1_CBAR(n)    (4u * (n))
++#define   CBAR_S1_TRANS_S2_BYPASS (1u << 16)
++#define   CBAR_S1_BPSHCFG_NSH     (3u << 8)
++#define   CBAR_S1_MEMATTR_WB      (0xfu << 12)
++#define SMMU_GR1_CBA2R(n)   (0x800u + 4u * (n))
++#define   CBA2R_VA64        (1u << 0)
++#define SMMU_CB_SCTLR       0x000
++#define   SCTLR_CFRE        (1u << 5)
++#define   SCTLR_CFIE        (1u << 6)
++#define   SCTLR_CFCFG       (1u << 7)
++
++static void
++smmu_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
+ 
+ static void
+ usb_smmu_bypass(void)
+@@ -223,32 +251,25 @@ usb_smmu_bypass(void)
+ 	if (usb_smmu_pa == 0) {
+ 		return;
+ 	}
+-	vm_offset_t smmu = ml_io_map((vm_offset_t)usb_smmu_pa, 0x1000);
++	vm_offset_t smmu = ml_io_map((vm_offset_t)usb_smmu_pa, 0x100000);
+ 	if (smmu == 0) {
+ 		return;
+ 	}
+-	uint32_t scr0 = usb_rd(smmu, SMMU_SCR0), idr0 = usb_rd(smmu, SMMU_IDR0);
+-	unsigned nsmr = IDR0_NUMSMRG(idr0);
++	uint32_t scr0 = usb_rd(smmu, SMMU_SCR0), idr0 = usb_rd(smmu, SMMU_IDR0), idr1 = usb_rd(smmu, SMMU_IDR1);
++	unsigned nsmr = IDR0_NUMSMRG(idr0), numcb = IDR1_NUMCB(idr1), nums2cb = IDR1_NUMS2CB(idr1);
+ 	bool exids = (idr0 & IDR0_EXIDS) != 0;
+-	printf("SWEET USB: SMMU sCR0 0x%08x IDR0 0x%08x: %u stream match groups%s%s\n", scr0, idr0, nsmr,
++	uint32_t pagesize = (idr1 & IDR1_PAGESIZE_64K) ? 0x10000u : 0x1000u;
++	uint32_t size = (1u << (IDR1_NUMPAGENDXB(idr1) + 1)) * pagesize;
++	vm_offset_t gr1 = smmu + pagesize, cb_base = smmu + size / 2;
++	printf("SWEET USB: SMMU sCR0 0x%08x IDR0 0x%08x IDR1 0x%08x: %u stream match groups, %u context banks (%u stage 2), page %#x, size %#x%s%s\n",
++	    scr0, idr0, idr1, nsmr, numcb, nums2cb, pagesize, size,
+ 	    (scr0 & SCR0_CLIENTPD) ? ", client port disabled (global bypass)" : "",
+ 	    (scr0 & SCR0_USFCFG) ? ", unmatched streams fault" : ", unmatched streams bypass");
+-	if (scr0 & SCR0_CLIENTPD) {
+-		return;
+-	}
+-	if (!(idr0 & IDR0_SMS)) {
+-		/* stream indexing: the stream ID selects its S2CR directly */
+-		uint32_t s2cr = usb_rd(smmu, SMMU_S2CR(usb_smmu_sid));
+-		*(volatile uint32_t *)(smmu + SMMU_S2CR(usb_smmu_sid)) = (s2cr & ~S2CR_TYPE_MASK) | S2CR_TYPE_BYPASS;
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		printf("SWEET USB: SMMU stream 0x%x S2CR 0x%08x -> 0x%08x (bypass, stream indexing)\n",
+-		    usb_smmu_sid, s2cr, usb_rd(smmu, SMMU_S2CR(usb_smmu_sid)));
+-		return;
+-	}
+-	if (nsmr == 0) {
++	if ((scr0 & SCR0_CLIENTPD) || !(idr0 & IDR0_SMS) || nsmr == 0 || numcb == 0 || size > 0x100000u) {
+ 		return;
+ 	}
+-	int found = -1, spare = -1;
++	/* the stream's match group: the one ABL set up, else a spare one */
++	int group = -1, spare = -1;
+ 	for (unsigned i = 0; i < nsmr; i++) {
+ 		uint32_t smr = usb_rd(smmu, SMMU_SMR(i)), s2cr = usb_rd(smmu, SMMU_S2CR(i));
+ 		bool valid = exids ? (s2cr & S2CR_EXIDVALID) != 0 : (smr & SMR_VALID) != 0;
+@@ -263,34 +284,56 @@ usb_smmu_bypass(void)
+ 		if ((id & ~mask) == (usb_smmu_sid & ~mask)) {
+ 			printf("SWEET USB: SMMU stream 0x%x matched by group %u: SMR 0x%08x S2CR 0x%08x\n",
+ 			    usb_smmu_sid, i, smr, s2cr);
+-			found = (int)i;
++			group = (int)i;
+ 			break;
+ 		}
+ 	}
+-	if (found >= 0) {
+-		uint32_t s2cr = usb_rd(smmu, SMMU_S2CR(found));
+-		*(volatile uint32_t *)(smmu + SMMU_S2CR(found)) = (s2cr & ~S2CR_TYPE_MASK) | S2CR_TYPE_BYPASS;
+-	} else if (!(scr0 & SCR0_USFCFG)) {
+-		printf("SWEET USB: SMMU stream 0x%x unmatched, already bypasses\n", usb_smmu_sid);
++	if (group < 0 && spare < 0) {
++		printf("SWEET USB: SMMU has no spare stream match group for stream 0x%x\n", usb_smmu_sid);
++		return;
++	}
++	/* a stage 1 context bank no valid group refers to, from the top */
++	int cb = -1;
++	for (int n = (int)numcb - 1; n >= (int)nums2cb && cb < 0; n--) {
++		bool used = false;
++		for (unsigned i = 0; i < nsmr && !used; i++) {
++			uint32_t smr = usb_rd(smmu, SMMU_SMR(i)), s2cr = usb_rd(smmu, SMMU_S2CR(i));
++			bool valid = exids ? (s2cr & S2CR_EXIDVALID) != 0 : (smr & SMR_VALID) != 0;
++			used = valid && (s2cr & S2CR_TYPE_MASK) == 0 && (s2cr & S2CR_CBNDX_MASK) == (uint32_t)n;
++		}
++		if (!used) {
++			cb = n;
++		}
++	}
++	if (cb < 0) {
++		printf("SWEET USB: SMMU has no free context bank\n");
+ 		return;
+-	} else if (spare >= 0) {
+-		found = spare;
++	}
++	/* stage 1 bank with translation off = identity, stage 2 bypassed */
++	smmu_wr(gr1, SMMU_GR1_CBA2R((unsigned)cb), CBA2R_VA64);
++	smmu_wr(gr1, SMMU_GR1_CBAR((unsigned)cb), CBAR_S1_TRANS_S2_BYPASS | CBAR_S1_BPSHCFG_NSH | CBAR_S1_MEMATTR_WB);
++	smmu_wr(cb_base + (unsigned)cb * pagesize, SMMU_CB_SCTLR, SCTLR_CFCFG | SCTLR_CFIE | SCTLR_CFRE);
++	if (group >= 0) {
++		uint32_t s2cr = usb_rd(smmu, SMMU_S2CR(group));
++		smmu_wr(smmu, SMMU_S2CR(group), (s2cr & ~(S2CR_TYPE_MASK | S2CR_CBNDX_MASK)) | (uint32_t)cb);
++	} else {
++		group = spare;
+ 		if (exids) {
+-			*(volatile uint32_t *)(smmu + SMMU_SMR(found)) = usb_smmu_sid;
+-			__asm__ volatile ("dsb sy" ::: "memory");
+-			*(volatile uint32_t *)(smmu + SMMU_S2CR(found)) = S2CR_TYPE_BYPASS | S2CR_EXIDVALID;
++			smmu_wr(smmu, SMMU_SMR(group), usb_smmu_sid);
++			smmu_wr(smmu, SMMU_S2CR(group), S2CR_EXIDVALID | (uint32_t)cb);
+ 		} else {
+-			*(volatile uint32_t *)(smmu + SMMU_S2CR(found)) = S2CR_TYPE_BYPASS;
+-			__asm__ volatile ("dsb sy" ::: "memory");
+-			*(volatile uint32_t *)(smmu + SMMU_SMR(found)) = SMR_VALID | usb_smmu_sid;
++			smmu_wr(smmu, SMMU_S2CR(group), (uint32_t)cb);
++			smmu_wr(smmu, SMMU_SMR(group), SMR_VALID | usb_smmu_sid);
+ 		}
+-	} else {
+-		printf("SWEET USB: SMMU has no spare stream match group for stream 0x%x\n", usb_smmu_sid);
+-		return;
+ 	}
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	printf("SWEET USB: SMMU group %d now SMR 0x%08x S2CR 0x%08x (bypass)\n", found,
+-	    usb_rd(smmu, SMMU_SMR(found)), usb_rd(smmu, SMMU_S2CR(found)));
++	smmu_wr(smmu, SMMU_TLBIALLNSNH, 0);
++	smmu_wr(smmu, SMMU_STLBGSYNC, 0);
++	for (unsigned i = 0; i < 10000 && (usb_rd(smmu, SMMU_STLBGSTATUS) & 1u); i++) {
++		delay(1);
++	}
++	printf("SWEET USB: SMMU group %d -> context bank %d: SMR 0x%08x S2CR 0x%08x CBAR 0x%08x SCTLR 0x%08x (identity)\n",
++	    group, cb, usb_rd(smmu, SMMU_SMR(group)), usb_rd(smmu, SMMU_S2CR(group)),
++	    usb_rd(gr1, SMMU_GR1_CBAR((unsigned)cb)), usb_rd(cb_base + (unsigned)cb * pagesize, SMMU_CB_SCTLR));
+ }
+ 
+ /* phy-msm-ssusb-qmp.c: indexes into ssphy-reg, and the bits it writes */
