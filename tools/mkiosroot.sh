@@ -3,6 +3,8 @@
 # root filesystem plus its cryptexes, for the userdata partition (rd=ufsroot0).
 #
 #   mkiosroot.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img [SIZE]     (SIZE default 16G)
+#   SWEETGL_DYLIB=tools/sweetgl/out/sweetgl.dylib in the environment also
+#   installs the gpu library (see tools/sweetgl/README.md)
 #
 # The IPSW images are raw APFS with LZBITMAP-compressed files: they are read
 # through apfs-fuse (decompressing), so the HFS+ copy is uncompressed. On a
@@ -126,6 +128,14 @@ printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
 	'<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' |
 	sudo install -m 0600 -o 0 -g 0 /dev/stdin "$work/root/private/var/keybags/systembag.kb"
+
+# the gpu library (tools/sweetgl, 64 MiB padded build), with its block runs
+# recorded so tools/sweetgl/push.sh can rewrite it in place from recovery
+if [[ -n ${SWEETGL_DYLIB:-} ]]; then
+	sudo install -m 0755 -o 0 -g 0 "$SWEETGL_DYLIB" "$work/root/usr/lib/sweetgl.dylib"
+	sync
+	sudo python3 -I "$(dirname "$0")/sweetgl/extents.py" "$work/root/usr/lib/sweetgl.dylib" > "$out.sweetgl-extents.txt"
+fi
 
 df -h "$work/root"
 sudo umount "$work/root"
