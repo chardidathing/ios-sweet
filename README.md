@@ -117,6 +117,8 @@ What the less obvious boot-args do:
 | `sweetfb_noconsole=1` | Stop drawing kernel text over the GUI. It still goes to the persistent log; panics are drawn |
 | `sweetfb_hz=30` | Panel refresh rate of the CPU copy |
 | `sweettouch=0`, `sweetkeys=0` | Disable the touch or button driver |
+| `sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib` | Add environment variables to named processes (`NAME:VAR=VAL,VAR=VAL;NAME:...`), needs `cs_enforcement_disable=1` for dyld to insert |
+| `sweetaccel=0` | Do not publish the `IOAcceleratorES` service CoreAnimation polls for |
 
 ### 4. Flash the root and boot
 
@@ -193,6 +195,8 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 | 0068 | IOSurface lookup semantics for already-mapped surfaces |
 | 0069 | Batched persistent-log flushes |
 | 0082–0084 | Board-independent kernel: framebuffer from boot-args, key wiring and board drivers from the device tree, iPhone X size on any panel |
+| 0085–0104 | pdx203: sec_ts touch, USB device mode on kona, MDP present through the SMMU |
+| 0105–0112 | Groundwork for the GPU path (from ios-sailfish): `sweetenv` boot-arg, AMFI dyld policy, IOSurface row alignment and creator-memory surfaces, 64 MB io map, `IOAcceleratorES`, IOKit quiesces |
 
 ## Key hardware facts
 
