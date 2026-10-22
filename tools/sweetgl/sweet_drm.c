@@ -17,6 +17,9 @@
  *   WAIT_FENCE, CPU_PREP     the read-only fence page, then sel 14
  *   GET_PARAM                sel 15 (chip id, GMEM) and constants
  *
+ * the selectors and the submit layout are the kernel contract in
+ * sweet_gpu_abi.h (shared with the xnu side).
+ *
  * One device per process; the "fd" is /dev/null (Mesa dup()s and closes
  * it). sweet_drm_import_iosurface() makes a GEM handle for an IOSurface
  * (sel 12) for the EAGL layer.
@@ -35,6 +38,7 @@
 #include "xf86drm.h"
 #include "drm-uapi/msm_drm.h"
 #include "sweet_drm.h"
+#include "sweet_gpu_abi.h"
 
 struct sbo {
 	uint64_t iova, map, size;
@@ -55,24 +59,24 @@ static uint32_t queues;
 static void
 connect_dev(void)
 {
-	io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("SweetGPU"));
+	io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(SWEET_GPU_SERVICE));
 	if (svc == 0 || IOServiceOpen(svc, mach_task_self(), 0, &conn) != KERN_SUCCESS) {
 		conn = 0;
 		return;
 	}
 	IOObjectRelease(svc);
-	uint64_t out[5];
-	uint32_t n = 5;
-	kern_return_t kr = IOConnectCallScalarMethod(conn, 15, NULL, 0, out, &n);
-	if (kr != KERN_SUCCESS || n != 5) {
+	uint64_t out[SWEET_GPU_INFO_COUNT];
+	uint32_t n = SWEET_GPU_INFO_COUNT;
+	kern_return_t kr = IOConnectCallScalarMethod(conn, SWEET_GPU_INFO, NULL, 0, out, &n);
+	if (kr != KERN_SUCCESS || n != SWEET_GPU_INFO_COUNT) {
 		IOServiceClose(conn);
 		conn = 0;
 		return;
 	}
-	chip_id = (uint32_t)out[0];
-	gmem_size = (uint32_t)out[1];
-	gmem_base = out[2];
-	max_freq = out[3];
+	chip_id = (uint32_t)out[SWEET_GPU_INFO_CHIP_ID];
+	gmem_size = (uint32_t)out[SWEET_GPU_INFO_GMEM];
+	gmem_base = out[SWEET_GPU_INFO_GMEM_BASE];
+	max_freq = out[SWEET_GPU_INFO_MAX_FREQ];
 	dev_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
 }
 
@@ -131,7 +135,7 @@ static int
 fence_passed(uint32_t seq)
 {
 	uint64_t in[2] = {seq, 0};
-	return IOConnectCallScalarMethod(conn, 14, in, 2, NULL, NULL) == KERN_SUCCESS;
+	return IOConnectCallScalarMethod(conn, SWEET_GPU_WAIT, in, 2, NULL, NULL) == KERN_SUCCESS;
 }
 
 /* Wait until seq completed, at most ms milliseconds (UINT64_MAX: forever). */
@@ -144,7 +148,7 @@ fence_wait(uint32_t seq, uint64_t ms)
 	for (;;) {
 		uint64_t chunk = ms > 5000 ? 5000 : ms;
 		uint64_t in[2] = {seq, chunk};
-		kern_return_t kr = IOConnectCallScalarMethod(conn, 14, in, 2, NULL, NULL);
+		kern_return_t kr = IOConnectCallScalarMethod(conn, SWEET_GPU_WAIT, in, 2, NULL, NULL);
 		if (kr == KERN_SUCCESS || fence_passed(seq)) {
 			return 0;
 		}
@@ -179,7 +183,8 @@ get_param(struct drm_msm_param *p)
 {
 	switch (p->param) {
 	case MSM_PARAM_GPU_ID:
-		p->value = 530;
+		/* mesa matches on this before the chip id, 650 for 0x0605xxxx */
+		p->value = (chip_id >> 24) * 100 + ((chip_id >> 16) & 0xff) * 10 + ((chip_id >> 8) & 0xff);
 		return 0;
 	case MSM_PARAM_GMEM_SIZE:
 		p->value = gmem_size;
@@ -214,7 +219,7 @@ gem_new(struct drm_msm_gem_new *r)
 {
 	uint64_t in = r->size, out[3];
 	uint32_t n = 3;
-	kern_return_t kr = IOConnectCallScalarMethod(conn, 10, &in, 1, out, &n);
+	kern_return_t kr = IOConnectCallScalarMethod(conn, SWEET_GPU_BO_NEW, &in, 1, out, &n);
 	if (kr != KERN_SUCCESS) {
 		sweet_drm_log("sweetgl: bo new %llu failed: %x", r->size, kr);
 		return -ENOMEM;
@@ -223,7 +228,7 @@ gem_new(struct drm_msm_gem_new *r)
 	int ret = sbo_add((uint32_t)out[0], out[1], out[2], (r->size + 16383) & ~16383ull);
 	pthread_mutex_unlock(&lock);
 	if (ret) {
-		IOConnectCallScalarMethod(conn, 11, out, 1, NULL, NULL);
+		IOConnectCallScalarMethod(conn, SWEET_GPU_BO_FREE, out, 1, NULL, NULL);
 		return ret;
 	}
 	r->handle = (uint32_t)out[0];
@@ -240,7 +245,7 @@ gem_close(uint32_t handle)
 	}
 	pthread_mutex_unlock(&lock);
 	uint64_t in = handle;
-	return b && IOConnectCallScalarMethod(conn, 11, &in, 1, NULL, NULL) == KERN_SUCCESS ? 0 : -EINVAL;
+	return b && IOConnectCallScalarMethod(conn, SWEET_GPU_BO_FREE, &in, 1, NULL, NULL) == KERN_SUCCESS ? 0 : -EINVAL;
 }
 
 static int
@@ -293,7 +298,7 @@ cpu_prep(struct drm_msm_gem_cpu_prep *r)
 	}
 	/* the bo is CPU-cached: drop stale lines over what the GPU wrote */
 	uint64_t in = r->handle;
-	return !used || IOConnectCallScalarMethod(conn, 16, &in, 1, NULL, NULL) == KERN_SUCCESS ? 0 : -EIO;
+	return !used || IOConnectCallScalarMethod(conn, SWEET_GPU_BO_CPU_PREP, &in, 1, NULL, NULL) == KERN_SUCCESS ? 0 : -EIO;
 }
 
 static int
@@ -305,13 +310,17 @@ gem_submit(struct drm_msm_gem_submit *r)
 	}
 	const struct drm_msm_gem_submit_bo *sb = (const void *)(uintptr_t)r->bos;
 	const struct drm_msm_gem_submit_cmd *sc = (const void *)(uintptr_t)r->cmds;
-	size_t len = 8 + r->nr_cmds * 16 + r->nr_bos * 4;
+	if (r->nr_cmds > SWEET_GPU_MAX_IBS || r->nr_bos > SWEET_GPU_MAX_BOS) {
+		return -EINVAL;
+	}
+	size_t len = sizeof(struct sweet_gpu_submit) + r->nr_cmds * sizeof(struct sweet_gpu_ib) + r->nr_bos * 4;
 	uint8_t *buf = malloc(len);
 	if (buf == NULL) {
 		return -ENOMEM;
 	}
-	uint32_t *hdr = (uint32_t *)buf, nib = 0;
-	uint8_t *ib = buf + 8;
+	struct sweet_gpu_submit *hdr = (struct sweet_gpu_submit *)buf;
+	uint32_t nib = 0;
+	struct sweet_gpu_ib *ib = (struct sweet_gpu_ib *)(buf + sizeof(*hdr));
 	pthread_mutex_lock(&lock);
 	int ret = 0;
 	for (uint32_t i = 0; i < r->nr_cmds && ret == 0; i++) {
@@ -324,11 +333,9 @@ gem_submit(struct drm_msm_gem_submit *r)
 			ret = -EINVAL;
 			break;
 		}
-		uint64_t va = b->iova + sc[i].submit_offset;
-		uint32_t dw[4] = {(uint32_t)va, (uint32_t)(va >> 32), sc[i].size / 4, 0};
-		memcpy(ib + 16 * nib++, dw, 16);
+		ib[nib++] = (struct sweet_gpu_ib){ .iova = b->iova + sc[i].submit_offset, .dwords = sc[i].size / 4 };
 	}
-	uint32_t *handles = (uint32_t *)(ib + 16 * nib);
+	uint32_t *handles = (uint32_t *)(ib + nib);
 	for (uint32_t i = 0; i < r->nr_bos && ret == 0; i++) {
 		if (sbo(sb[i].handle) == NULL) {
 			ret = -EINVAL;
@@ -342,10 +349,10 @@ gem_submit(struct drm_msm_gem_submit *r)
 	uint64_t seq = 0;
 	uint32_t n = 1;
 	if (ret == 0) {
-		hdr[0] = nib;
-		hdr[1] = r->nr_bos;
-		kern_return_t kr = IOConnectCallMethod(conn, 13, NULL, 0, buf, 8 + nib * 16 + r->nr_bos * 4,
-		    &seq, &n, NULL, NULL);
+		hdr->nr_ibs = nib;
+		hdr->nr_bos = r->nr_bos;
+		kern_return_t kr = IOConnectCallMethod(conn, SWEET_GPU_SUBMIT, NULL, 0, buf,
+		    sizeof(*hdr) + nib * sizeof(*ib) + r->nr_bos * 4, &seq, &n, NULL, NULL);
 		if (kr != KERN_SUCCESS) {
 			sweet_drm_log("sweetgl: submit (%u IBs, %u bos) failed: %x", nib, r->nr_bos, kr);
 			ret = kr == kIOReturnNotReady ? -ENODEV : -EINVAL;
@@ -473,14 +480,14 @@ sweet_drm_import_iosurface(uint32_t surface_id, uint64_t map, uint32_t *handle, 
 	}
 	uint64_t in = surface_id, out[3];
 	uint32_t n = 3;
-	if (IOConnectCallScalarMethod(conn, 12, &in, 1, out, &n) != KERN_SUCCESS) {
+	if (IOConnectCallScalarMethod(conn, SWEET_GPU_BO_IMPORT, &in, 1, out, &n) != KERN_SUCCESS) {
 		return -ENOENT;
 	}
 	pthread_mutex_lock(&lock);
 	int ret = sbo_add((uint32_t)out[0], out[1], map, out[2]);
 	pthread_mutex_unlock(&lock);
 	if (ret) {
-		IOConnectCallScalarMethod(conn, 11, out, 1, NULL, NULL);
+		IOConnectCallScalarMethod(conn, SWEET_GPU_BO_FREE, out, 1, NULL, NULL);
 		return ret;
 	}
 	*handle = (uint32_t)out[0];

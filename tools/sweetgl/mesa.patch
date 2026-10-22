@@ -1,14 +1,16 @@
-mesa.patch, after ios-sailfish by joranv1: see tools/sweetgl/README.md
+mesa.patch, after ios-sailfish by joranv1: mesa freedreno on ios, see tools/sweetgl/README.md
+applies to mesa 45a949a91f098b80b999636008e9facbd5633408 (main, 2026-10-03, the commit ios-sailfish built against)
 
 diff --git a/src/freedreno/drm/freedreno_bo.c b/src/freedreno/drm/freedreno_bo.c
-index 6eda810..ab48aa0 100644
+index 6eda8101e46..45b6173000e 100644
 --- a/src/freedreno/drm/freedreno_bo.c
 +++ b/src/freedreno/drm/freedreno_bo.c
-@@ -12,6 +12,13 @@
+@@ -12,6 +12,14 @@
  #include "freedreno_drm_perfetto.h"
  #include "freedreno_priv.h"
  
 +#ifdef __APPLE__
++/* no drm mmap on ios: the kernel mapped the bo at bo new, sweet_drm.c hands it back */
 +void *sweet_drm_bo_map(int fd, uint64_t offset);
 +#undef os_mmap
 +#define os_mmap(addr, length, prot, flags, fd, offset) sweet_drm_bo_map(fd, offset)
@@ -18,8 +20,28 @@ index 6eda810..ab48aa0 100644
  simple_mtx_t table_lock = SIMPLE_MTX_INITIALIZER;
  simple_mtx_t fence_lock = SIMPLE_MTX_INITIALIZER;
  
+diff --git a/src/freedreno/fdl/fd6_layout.c b/src/freedreno/fdl/fd6_layout.c
+index 19c38a2d031..9016052bcf7 100644
+--- a/src/freedreno/fdl/fd6_layout.c
++++ b/src/freedreno/fdl/fd6_layout.c
+@@ -196,6 +196,15 @@ fdl6_layout_image(struct fdl_layout *layout, const struct fd_dev_info *info,
+          if (layout->cpp > 4)
+             layout->pitchalign = fdl_cpp_shift(layout) - 2;
+ 
++#ifdef __APPLE__
++         /* sweetgl renders in sysmem only (FD_MESA_DEBUG=sysmem), nothing is
++          * stored through gmem, so an imported iosurface row that is a multiple
++          * of 64 bytes is enough above 4 bytes per pixel too (CoreAnimation's
++          * RGBA16F surfaces come at 64 byte pitches) */
++         if (explicit_layout && explicit_layout->pitch % 64 == 0)
++            layout->pitchalign = 0;
++#endif
++
+          /* when possible, use a bit more alignment than necessary
+           * presumably this is better for performance?
+           */
 diff --git a/src/freedreno/meson.build b/src/freedreno/meson.build
-index e8f01b8..a6c37f9 100644
+index e8f01b880bc..a6c37f90bf0 100644
 --- a/src/freedreno/meson.build
 +++ b/src/freedreno/meson.build
 @@ -22,7 +22,7 @@ subdir('ir2')
@@ -31,20 +53,3 @@ index e8f01b8..a6c37f9 100644
    subdir('drm')
  endif
  
-diff --git a/src/gallium/drivers/freedreno/freedreno_resource.c b/src/gallium/drivers/freedreno/freedreno_resource.c
-index 29134ba..0c3fdbb 100644
---- a/src/gallium/drivers/freedreno/freedreno_resource.c
-+++ b/src/gallium/drivers/freedreno/freedreno_resource.c
-@@ -1745,6 +1745,12 @@ fd_layout_resource_for_handle(struct fd_resource *rsc, struct winsys_handle *han
-    else
-       rsc->layout.pitchalign = MAX2(rsc->layout.pitchalign, 5);
- 
-+#ifdef __APPLE__
-+   if (is_a5xx(screen) && handle->modifier == DRM_FORMAT_MOD_LINEAR &&
-+       handle->stride % 64 == 0)
-+      rsc->layout.pitchalign = 6;
-+#endif
-+
-    if (rsc->layout.pitch0 < (prsc->width0 * rsc->layout.cpp) ||
-        fd_resource_pitch(rsc, 0) != rsc->layout.pitch0)
-       return false;

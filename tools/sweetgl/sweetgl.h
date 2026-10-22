@@ -1,4 +1,4 @@
-/* sweetgl: Mesa GLES on the Adreno 530 (sweetgl.c). */
+/* sweetgl: Mesa GLES on the Adreno 650 (sweetgl.c). */
 /* after ios-sailfish by joranv1, ported to the xperia 1 ii (pdx203) */
 #ifndef SWEETGL_H
 #define SWEETGL_H
