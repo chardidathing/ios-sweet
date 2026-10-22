@@ -1,0 +1,47 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4d..ff76669 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -305,8 +305,33 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ }
+ 
++/*
++ * policy "AMFI" syscalls. dyld asks op 0x5a (amfi_check_dyld_policy_self,
++ * arg -> {u64 in_flags; u64 *out_flags}) which DYLD_* variables to honour,
++ * on failure it honours none, so DYLD_INSERT_LIBRARIES from sweetenv was
++ * ignored. allow @paths, path variables, fallback paths, print variables,
++ * failed insertions (a bad dylib must not kill backboardd) and interposing.
++ * other ops fail as before (no policy).
++ */
++#define SWEET_AMFI_DYLD_FLAGS   0x7bull
++
++static int
++sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	uint64_t a[2], flags = SWEET_AMFI_DYLD_FLAGS;
++
++	if (call != 0x5a) {
++		return ENOPOLICY;
++	}
++	if (copyin(arg, a, sizeof(a)) != 0 || a[1] == 0) {
++		return EFAULT;
++	}
++	return copyout(&flags, (user_addr_t)a[1], sizeof(flags));
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_amfi_syscall,
+ };
+ 
+ /*
+@@ -360,7 +385,7 @@ static struct mac_policy_conf sweet_sandbox_mac_conf = {
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",             /* __mac_syscall("AMFI", ...) finds it by name */
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };
