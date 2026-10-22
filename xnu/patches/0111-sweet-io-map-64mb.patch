@@ -1,0 +1,19 @@
+diff --git a/osfmk/arm/io_map.c b/osfmk/arm/io_map.c
+index 18ef2f0..11956c9 100644
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,7 +62,13 @@
+ 
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+ 
+-#define IO_MAP_SIZE            (8ul << 20)
++/*
++ * SWEET: 64 MB (was 8). the soc drivers (apps smmu 1 MB, mdp, gcc, tlmm,
++ * ufs, usb, spmi, rpmh and the gpu to come) map dozens of register pages
++ * through the submap, with 8 MB a 16 KB mapping panicked kmem_alloc
++ * depending on the boot-args (seen on the pixel port).
++ */
++#define IO_MAP_SIZE            (64ul << 20)
+ 
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
