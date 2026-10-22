@@ -1,0 +1,84 @@
+name: sweetgl
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [gles-user]
+    paths:
+      - "tools/sweetgl/**"
+      - ".github/workflows/sweetgl.yml"
+
+concurrency:
+  group: sweetgl-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MESA_REPO: https://gitlab.freedesktop.org/mesa/mesa.git
+  # main of 2026-10-03, the commit ios-sailfish's mesa.patch was cut against
+  MESA_SHA: 45a949a91f098b80b999636008e9facbd5633408
+  MESA_SRC: ${{ github.workspace }}/research/mesa
+  MESA_BUILD: ${{ github.workspace }}/research/mesa-ios
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode
+        run: |
+          # newest 15.x when there is one (ios-sailfish built with 15.4), else whatever is selected
+          XC=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$XC" ]; then sudo xcode-select -s "$XC"; fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Deps
+        run: |
+          brew install bison flex
+          python3 -m venv "$HOME/venv"
+          "$HOME/venv/bin/pip" -q install meson ninja mako pyyaml packaging
+          echo "$HOME/venv/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+
+      # the meson build dir keeps absolute paths and ninja goes by mtimes, so
+      # source and build dir travel together or the rebuild is from scratch
+      - name: Mesa cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            research/mesa
+            research/mesa-ios
+            research/mesa-ios.cross.txt
+          key: mesa-${{ env.MESA_SHA }}-${{ hashFiles('tools/sweetgl/mesa.patch', 'tools/sweetgl/ios-cross.txt', 'tools/sweetgl/mesa-setup.sh', 'tools/sweetgl/include/**') }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Fetch and configure Mesa
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p research/mesa
+          git -C research/mesa init -q
+          git -C research/mesa fetch -q --depth 1 "$MESA_REPO" "$MESA_SHA"
+          git -C research/mesa checkout -q FETCH_HEAD
+          git -C research/mesa apply "$GITHUB_WORKSPACE/tools/sweetgl/mesa.patch"
+          git -C research/mesa diff --stat
+          sh tools/sweetgl/mesa-setup.sh
+
+      - name: Build
+        run: |
+          sh tools/sweetgl/build.sh
+          ls -la tools/sweetgl/out
+          (cd tools/sweetgl/out && shasum -a 256 sweetgl.dylib sweetgl-unpadded.dylib > SHA256SUMS && cat SHA256SUMS)
+          xcrun -sdk iphoneos otool -L tools/sweetgl/out/sweetgl-unpadded.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweetgl
+          path: |
+            tools/sweetgl/out/sweetgl.dylib
+            tools/sweetgl/out/sweetgl-unpadded.dylib
+            tools/sweetgl/out/dispatch.c
+            tools/sweetgl/out/SHA256SUMS
+          if-no-files-found: error

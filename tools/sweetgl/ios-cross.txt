@@ -1,14 +1,16 @@
+# meson cross file template for mesa on ios 16 arm64, after ios-sailfish by joranv1
+# mesa-setup.sh fills the @...@ fields from xcrun (meson takes no env in here)
 [binaries]
-c = ['/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang', '-arch', 'arm64', '-isysroot', '/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.5.sdk', '-miphoneos-version-min=16.0']
-cpp = ['/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang++', '-arch', 'arm64', '-isysroot', '/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.5.sdk', '-miphoneos-version-min=16.0']
-objc = ['/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang', '-arch', 'arm64', '-isysroot', '/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.5.sdk', '-miphoneos-version-min=16.0']
-ar = '/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ar'
-strip = '/Volumes/SamsungSSD/ios-sailfish/research/xcode15/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/strip'
+c = ['@CLANG@', '-arch', 'arm64', '-isysroot', '@SDK@', '-miphoneos-version-min=16.0']
+cpp = ['@CLANGXX@', '-arch', 'arm64', '-isysroot', '@SDK@', '-miphoneos-version-min=16.0']
+objc = ['@CLANG@', '-arch', 'arm64', '-isysroot', '@SDK@', '-miphoneos-version-min=16.0']
+ar = '@AR@'
+strip = '@STRIP@'
 pkg-config = 'false'
 
 [built-in options]
-c_args = ['-I/Volumes/SamsungSSD/ios-sailfish/tools/sweetgl/include']
-cpp_args = ['-I/Volumes/SamsungSSD/ios-sailfish/tools/sweetgl/include']
+c_args = ['-I@INC@']
+cpp_args = ['-I@INC@']
 
 [host_machine]
 system = 'darwin'

@@ -1,17 +1,16 @@
 #!/bin/sh
 # after ios-sailfish by joranv1, ported to the xperia 1 ii (pdx203)
-# Build sweetgl.dylib (Mesa freedreno + GLES + our frontend) for iOS 16
-# arm64: Mesa static libs from research/mesa-ios (tools/sweetgl/mesa-setup.sh,
-# after `git apply tools/sweetgl/mesa.patch` in research/mesa), ad-hoc signed,
-# zero-padded to 64 MiB so the file on the phone keeps one size and can be
-# rewritten in place (like tools/sweetgpu-ca).
+# build sweetgl.dylib (mesa freedreno + gles + the eagl shim) for ios 16
+# arm64 from the static libs in MESA_BUILD (mesa-setup.sh), ad-hoc signed and
+# zero-padded to 64 MiB so the file on the phone keeps one size and one set
+# of extents (push.sh rewrites it in place).
+#   MESA_SRC=research/mesa MESA_BUILD=research/mesa-ios tools/sweetgl/build.sh
 set -e
 H=$(cd "$(dirname "$0")" && pwd)
-R=$H/../..
-M=$R/research/mesa
-B=$R/research/mesa-ios
-export DEVELOPER_DIR=$R/research/xcode15/Xcode.app/Contents/Developer
-export PATH=$R/research/tools/venv/bin:$R/research/tools/bin:$PATH
+R=$(cd "$H/../.." && pwd)
+M=$(cd "${MESA_SRC:-$R/research/mesa}" && pwd)
+B=$(cd "${MESA_BUILD:-$R/research/mesa-ios}" && pwd)
+PAD=67108864
 LIBS="src/mesa/libmesa.a src/gallium/auxiliary/libgallium.a
 	src/gallium/drivers/freedreno/libfreedreno.a src/gallium/winsys/freedreno/drm/libfreedrenowinsys.a
 	src/freedreno/drm/libfreedreno_drm.a src/freedreno/ir3/libfreedreno_ir3.a
@@ -25,14 +24,14 @@ LIBS="src/mesa/libmesa.a src/gallium/auxiliary/libgallium.a
 	src/util/libxmlconfig.a src/util/libmesa_util.a src/util/libmesa_util_simd.a src/util/blake3/libblake3.a
 	src/c11/impl/libmesa_util_c11.a"
 (cd "$B" && ninja $LIBS)
-nm -g "$B/src/mesa/glapi/glapi/libglapi_bridge.a" > "$H/out/bridge.nm"
+O=$H/out
+mkdir -p "$O"
+nm -g "$B/src/mesa/glapi/glapi/libglapi_bridge.a" > "$O/bridge.nm"
 CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0"
 INC="-I$H/include -I$M/include -I$M/src -I$M/src/mesa -I$M/src/mapi -I$M/src/gallium/include
 	-I$M/src/gallium/auxiliary -I$M/src/gallium/drivers -I$M/src/gallium/winsys
 	-I$B/src -I$B/src/mesa -I$B/src/mapi"
-O=$H/out
-mkdir -p "$O"
-# Mesa's configure-time defines (HAVE_PTHREAD, ...) as the state tracker gets them
+# mesa's configure-time defines (HAVE_PTHREAD, ...) as the state tracker gets them
 python3 -I -c '
 import json, shlex, sys
 cc = json.load(open(sys.argv[1]))
@@ -51,7 +50,7 @@ xcrun -sdk iphoneos clang++ -arch arm64 -miphoneos-version-min=16.0 -dynamiclib 
 	-framework IOKit -framework CoreFoundation -framework IOSurface -framework OpenGLES -framework CoreGraphics -lobjc -lc++ -lz
 codesign -f -s - "$O/sweetgl.dylib"
 SIZE=$(stat -f %z "$O/sweetgl.dylib")
-[ "$SIZE" -le 67108864 ] || { echo "sweetgl.dylib is $SIZE bytes, over 64 MiB"; exit 1; }
+[ "$SIZE" -le $PAD ] || { echo "sweetgl.dylib is $SIZE bytes, over 64 MiB"; exit 1; }
 cp "$O/sweetgl.dylib" "$O/sweetgl-unpadded.dylib"
-truncate -s 67108864 "$O/sweetgl.dylib"
+truncate -s $PAD "$O/sweetgl.dylib"
 echo "built $O/sweetgl.dylib ($SIZE bytes, padded to 64 MiB)"
