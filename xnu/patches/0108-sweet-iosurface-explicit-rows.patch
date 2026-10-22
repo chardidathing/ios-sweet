@@ -1,0 +1,65 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 3c72303..e345ab4 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -283,12 +283,36 @@ sweet_div_up(uint32_t a, uint32_t b)
+ }
+ 
+ static uint32_t
+-sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
++sweet_row_align(uint64_t row)
+ {
+-	uint64_t row = (uint64_t)sweet_div_up(width, ew) * bpe;
+ 	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
+ }
+ 
++static uint32_t
++sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
++{
++	return sweet_row_align((uint64_t)sweet_div_up(width, ew) * bpe);
++}
++
++/*
++ * row bytes for an explicit value (0: none). explicit rows are rounded up
++ * to the alignment too: the adreno texture and render target pitch needs
++ * 64-byte rows, and CA takes the real value from the lock result
++ * (SpringBoard asks for 833 px in 3360 bytes and renders into it on the
++ * gpu). bare geometry requests (6 keys or fewer) get them as asked: CoreUI
++ * fills its glyph surfaces with the row bytes it asked for (sweetgl copies
++ * those). the key count is what tells CoreUI from CA, if that stops
++ * working a creator's backtrace is the next thing to look at.
++ */
++static uint32_t
++sweet_rows(uint32_t asked, uint32_t width, uint32_t ew, uint32_t bpe, unsigned int keys)
++{
++	if (asked == 0) {
++		return sweet_row_bytes(width, ew, bpe);
++	}
++	return keys <= 6 ? asked : sweet_row_align(asked);
++}
++
+ /* Geometry from the creation properties (IOSurface.h keys). */
+ static IOReturn
+ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -307,8 +331,8 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	    s->bytesPerElement > 64 || s->elementWidth == 0 || s->elementHeight == 0) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow",
+-	    sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement));
++	s->bytesPerRow = sweet_rows(sweet_dict_u32(props, "IOSurfaceBytesPerRow", 0),
++	    s->width, s->elementWidth, s->bytesPerElement, props->getCount());
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
+@@ -336,8 +360,8 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			    p->bytesPerElement > 64 || p->elementWidth == 0 || p->elementHeight == 0) {
+ 				return kIOReturnBadArgument;
+ 			}
+-			p->bytesPerRow = sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow",
+-			    sweet_row_bytes(p->width, p->elementWidth, p->bytesPerElement));
++			p->bytesPerRow = sweet_rows(sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow", 0),
++			    p->width, p->elementWidth, p->bytesPerElement, props->getCount());
+ 			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
+ 			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
+ 			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));
