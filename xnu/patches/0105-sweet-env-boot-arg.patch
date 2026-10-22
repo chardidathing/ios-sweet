@@ -1,0 +1,97 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..8bb576a 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -451,6 +451,78 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
+  */
+ #define EXECUTABLE_KEY "executable_path="
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * boot-arg sweetenv=NAME:VAR=VAL[,VAR=VAL...][;NAME:...] appends VAR=VAL to
++ * the environment of every executable whose file name is NAME, e.g.
++ * sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib (the
++ * gles shim gets into backboardd without editing its launchd plist on the
++ * phone). entries for several names are separated by ';'.
++ */
++static int
++sweet_exec_env(struct image_params *imgp, int ptr_size)
++{
++	static char spec[512];
++	static int state;       /* 0 not parsed, 1 none, 2 set */
++	if (state == 0) {
++		state = PE_parse_boot_argn("sweetenv", spec, sizeof(spec)) && spec[0] ? 2 : 1;
++	}
++	if (state != 2) {
++		return 0;
++	}
++	const char *path = imgp->ip_strings + strlen(EXECUTABLE_KEY), *base = path;
++	for (const char *c = path; *c; c++) {
++		if (*c == '/') {
++			base = c + 1;
++		}
++	}
++	const char *entry = spec;
++	for (;;) {
++		size_t n = 0;
++		while (entry[n] && entry[n] != ':' && entry[n] != ';') {
++			n++;
++		}
++		if (entry[n] == ':' && strlen(base) == n && strncmp(base, entry, n) == 0) {
++			break;
++		}
++		while (*entry && *entry != ';') {
++			entry++;
++		}
++		if (*entry == '\0') {
++			return 0;
++		}
++		entry++;
++	}
++	const char *p = strchr(entry, ':') + 1;
++	while (*p && *p != ';') {
++		char var[128];
++		size_t len = 0;
++		while (p[len] && p[len] != ',' && p[len] != ';') {
++			len++;
++		}
++		if (len > 0 && len < sizeof(var)) {
++			memcpy(var, p, len);
++			var[len] = '\0';
++			int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(var), UIO_SYSSPACE, TRUE);
++			if (error) {
++				return error;
++			}
++			if (imgp->ip_argspace < ptr_size) {
++				return E2BIG;
++			}
++			imgp->ip_argspace -= ptr_size;
++			imgp->ip_envc++;
++			printf("SWEET ENV: %s += %s\n", base, var);
++		}
++		p += len;
++		if (*p == ',') {
++			p++;
++		}
++	}
++	return 0;
++}
++#endif
++
+ /*
+  * exec_save_path
+  *
+@@ -5741,6 +5813,13 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	error = sweet_exec_env(imgp, new_ptr_size);
++	if (error) {
++		goto bad;
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
