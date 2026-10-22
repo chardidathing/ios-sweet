@@ -1,0 +1,41 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 46f0e0b..6ed0018 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -199,8 +199,9 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit));
+ 	if (!native && mdp != 0 && sweet_mdp_init(fPhys, fWidth, fHeight, fLogicalW, fLogicalH, fit)) {
+ 		/* the pipe scales a logical-size buffer, so the driver's own target is
+-		 * one too (the splash buffer stays with the text console) */
+-		uint32_t rowBytes = fLogicalW * 4;
++		 * one too (the splash buffer stays with the text console). rows padded
++		 * like every other surface, the gpu renders into it (adreno pitch) */
++		uint32_t rowBytes = (fLogicalW * 4 + SWEET_SURFACE_ROW_ALIGN - 1) & ~(SWEET_SURFACE_ROW_ALIGN - 1);
+ 		vm_size_t size = (vm_size_t)rowBytes * fLogicalH;
+ 		IOByteCount len = 0;
+ 		fComposite = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 16ad269..81561a0 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -66,7 +66,6 @@ enum {
+ #define SWEET_SURFACE_MAX_DIM           16384
+ #define SWEET_SURFACE_MAX_ALLOC         (256u << 20)
+ #define SWEET_SURFACE_MAX_PROPS         (64u << 10)
+-#define SWEET_SURFACE_ROW_ALIGN         64
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index b3f482d..b6fa82f 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -17,6 +17,8 @@
+ #include <mach/mach_types.h>
+ 
+ #define SWEET_SURFACE_MAX_PLANES        20
++/* row bytes of every surface the driver lays out (the adreno pitch alignment) */
++#define SWEET_SURFACE_ROW_ALIGN         64
+ 
+ struct sweet_surface_plane {
+ 	uint32_t width, height, bytesPerRow, offset, size;
