@@ -4,7 +4,7 @@
 
 This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 10 Pro (`sweet`, Qualcomm SM7150 / Snapdragon 732G). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
 
-As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver.
+As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU for now; a GPU path through CoreAnimation's OpenGL ES renderer is in progress (see below).
 
 > Experimental bring-up, not a usable phone OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**.
 
@@ -29,7 +29,7 @@ As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock 
 
 - **Navigation:** you cannot leave an app (the home gesture and AssistiveTouch Home do nothing yet).
 - **No Wi-Fi, Bluetooth, cellular, audio, camera, sensors, GPS or SEP / Face ID.** Daemons for them start and fail or keep relaunching.
-- **No GPU.** Everything is drawn by the CPU at roughly 20–30 fps. The two Cortex-A76 cores are not used yet.
+- **No GPU yet.** Everything is drawn by the CPU at roughly 20–30 fps. Metal is not coming (it needs Apple's AGX driver), but CoreAnimation in iOS 16 still carries its OpenGL ES renderer, and [ios-sailfish](https://github.com/joranv1/ios-sailfish) runs it on Mesa freedreno through an EAGL shim loaded into backboardd, with a kernel driver that exposes msm-style buffers and command submission. The same build (20H392) ships here, so that path applies to the Adreno 650; the missing piece is the kernel bring-up (GMU, SQE microcode, zap shader, GPU SMMU). The two Cortex-A76 cores are not used yet.
 - **Few apps.** The image has only what is on the system volume. There is no App Store, no Apple ID, and some Settings pages are empty.
 - **Slow boot:** about 4 minutes on the Apple logo.
 - **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection. Do not put anything personal on it.
